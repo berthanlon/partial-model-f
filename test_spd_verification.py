@@ -1,20 +1,13 @@
-# test_neural_kf_v6.py
+# test_neural_kf_v7.py
 """
-Test FULLY UNSUPERVISED Neural KF (v6)
-
-No known dynamics (F matrix) - learns everything from data.
+Test v7 - Structured dynamics learning.
 """
 import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from nn_train import (
-    train_unsupervised_neural_kf, 
-    NeuralKFUnsupervised,
-    MeanNetUnsupervised,
-    CovNetUnsupervised
-)
+from nn_train import train_unsupervised_v7, NeuralKFv7, MeanNetStructured, CovNetSimple
 
 torch.set_default_dtype(torch.float32)
 np.random.seed(42)
@@ -28,7 +21,6 @@ nz = 2
 T_sample = 0.5
 RADAR_BASELINE = 150.0
 
-# True dynamics (used only for data generation, NOT for training)
 F_true = np.array([
     [1, T_sample, 0, 0],
     [0, 1, 0, 0],
@@ -50,8 +42,7 @@ R_true = np.eye(nz, dtype=np.float32) * sigma_r**2
 x0_mean = np.array([100.0, 1.0, 50.0, 0.5], dtype=np.float32)
 P0 = np.diag([10.0, 1.0, 10.0, 1.0]).astype(np.float32)
 
-# More training data for unsupervised learning
-n_train = 2000  # More data needed
+n_train = 2000
 n_test = 100
 n_timesteps = 20
 
@@ -60,7 +51,7 @@ print(f"Device: {device}")
 
 
 # =============================================================================
-# MEASUREMENT MODEL (this IS known - only the dynamics are unknown)
+# MEASUREMENT MODEL
 # =============================================================================
 def h_numpy(x):
     r1 = np.sqrt(x[0]**2 + x[2]**2 + 1e-12)
@@ -102,17 +93,16 @@ print(f"Train: {z_train.shape}, Test: {z_test.shape}")
 
 
 # =============================================================================
-# TRAIN - FULLY UNSUPERVISED
+# TRAIN
 # =============================================================================
-output_dir = "./test_output_v6_unsupervised"
+output_dir = "./test_output_v7"
 os.makedirs(output_dir, exist_ok=True)
 
 print("\n" + "="*60)
-print("TRAINING FULLY UNSUPERVISED NEURAL KF (v6)")
-print("NO F MATRIX - Learning dynamics from scratch!")
+print("TRAINING v7 - STRUCTURED DYNAMICS")
 print("="*60)
 
-mean_net, cov_net, history = train_unsupervised_neural_kf(
+mean_net, cov_net, history = train_unsupervised_v7(
     z_train=z_train,
     R=R_true,
     h_fn=h_torch,
@@ -120,11 +110,10 @@ mean_net, cov_net, history = train_unsupervised_neural_kf(
     P0=P0,
     nx=nx,
     nz=nz,
-    epochs=1000,  # More epochs needed
-    lr=5e-4,
+    epochs=1000,
+    lr=1e-3,
     device=str(device),
-    checkpoint_path=os.path.join(output_dir, 'neural_kf_v6_unsupervised.pth'),
-    curriculum=True,
+    checkpoint_path=os.path.join(output_dir, 'neural_kf_v7.pth'),
     verbose=True
 )
 
@@ -141,56 +130,62 @@ plt.subplot(1, 2, 2)
 plt.plot(history['T_curriculum'])
 plt.xlabel('Epoch')
 plt.ylabel('Sequence Length T')
-plt.title('Curriculum: Sequence Length')
+plt.title('Curriculum')
 plt.grid(True)
-
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=150)
 plt.close()
 
 
 # =============================================================================
-# UKF BASELINE (uses true F, Q)
+# CORRECT UKF BASELINE
 # =============================================================================
-class SimpleUKF:
-    def __init__(self, F, Q, R, h_fn):
+class CorrectUKF:
+    """Properly implemented UKF baseline."""
+    def __init__(self, F, Q, R, h_fn, alpha=0.001, beta=2.0, kappa=0.0):
         self.F, self.Q, self.R, self.h = F, Q, R, h_fn
         self.nx, self.nz = F.shape[0], R.shape[0]
         
-        alpha, beta, kappa = 0.001, 2.0, 0.0
+        # UKF parameters
         lmbda = alpha**2 * (self.nx + kappa) - self.nx
         self.gamma = np.sqrt(self.nx + lmbda)
         
         n = 2 * self.nx + 1
-        self.Wm = np.full(n, 0.5 / (self.nx + lmbda))
+        self.Wm = np.zeros(n)
+        self.Wc = np.zeros(n)
         self.Wm[0] = lmbda / (self.nx + lmbda)
-        self.Wc = self.Wm.copy()
-        self.Wc[0] += (1 - alpha**2 + beta)
+        self.Wc[0] = self.Wm[0] + (1 - alpha**2 + beta)
+        for i in range(1, n):
+            self.Wm[i] = 0.5 / (self.nx + lmbda)
+            self.Wc[i] = 0.5 / (self.nx + lmbda)
         self.n_sigma = n
     
     def run(self, z_seq, x0, P0):
         T = z_seq.shape[0]
-        xs, Ps = np.zeros((T, self.nx)), np.zeros((T, self.nx, self.nx))
-        x, P = x0.copy(), P0.copy()
+        xs = np.zeros((T, self.nx))
+        Ps = np.zeros((T, self.nx, self.nx))
+        
+        x = x0.copy()
+        P = P0.copy()
         
         for t in range(T):
+            # Predict
             x_pred = self.F @ x
             P_pred = self.F @ P @ self.F.T + self.Q
             
-            try:
-                L = np.linalg.cholesky((self.nx + self.gamma**2/(2*self.nx+1)) * P_pred + 1e-6*np.eye(self.nx))
-            except:
-                L = np.eye(self.nx)
-            
+            # Sigma points
+            P_sqrt = np.linalg.cholesky(P_pred + 1e-6 * np.eye(self.nx))
             sigma = np.zeros((self.n_sigma, self.nx))
             sigma[0] = x_pred
             for i in range(self.nx):
-                sigma[i+1] = x_pred + self.gamma * L[:, i]
-                sigma[self.nx+i+1] = x_pred - self.gamma * L[:, i]
+                sigma[i + 1] = x_pred + self.gamma * P_sqrt[:, i]
+                sigma[self.nx + i + 1] = x_pred - self.gamma * P_sqrt[:, i]
             
+            # Transform through measurement
             z_sigma = np.array([self.h(s) for s in sigma])
-            z_hat = self.Wm @ z_sigma
+            z_hat = np.sum(self.Wm[:, None] * z_sigma, axis=0)
             
+            # S and C
             S = self.R.copy()
             C = np.zeros((self.nx, self.nz))
             for i in range(self.n_sigma):
@@ -199,11 +194,14 @@ class SimpleUKF:
                 S += self.Wc[i] * np.outer(dz, dz)
                 C += self.Wc[i] * np.outer(dx, dz)
             
+            # Update
             K = C @ np.linalg.inv(S)
-            x = x_pred + K @ (z_seq[t] - z_hat)
+            y = z_seq[t] - z_hat
+            x = x_pred + K @ y
             P = P_pred - K @ S @ K.T
             
-            xs[t], Ps[t] = x, P
+            xs[t] = x
+            Ps[t] = P
         
         return xs, Ps
 
@@ -215,27 +213,23 @@ print("\n" + "="*60)
 print("TESTING")
 print("="*60)
 
-# Neural KF (unsupervised)
-neural_kf = NeuralKFUnsupervised(mean_net, cov_net, R_true, device)
+neural_kf = NeuralKFv7(mean_net, cov_net, R_true, device)
 
 test_idx = 0
 neural_states, neural_covs = neural_kf.run(z_test[test_idx], x0_mean, P0, h_torch)
 neural_states = neural_states[0]
-neural_covs = neural_covs[0]
 
-# UKF baseline (uses true F, Q - "cheating")
-ukf = SimpleUKF(F_true, Q_true, R_true, h_numpy)
+ukf = CorrectUKF(F_true, Q_true, R_true, h_numpy)
 ukf_states, ukf_covs = ukf.run(z_test[test_idx], x0_mean, P0)
 
 gt = gt_test[test_idx]
 
-# RMSE
 rmse_neural = np.sqrt(np.mean((neural_states[:, [0,2]] - gt[:, [0,2]])**2, axis=1))
 rmse_ukf = np.sqrt(np.mean((ukf_states[:, [0,2]] - gt[:, [0,2]])**2, axis=1))
 
-print(f"\nSingle sequence RMSE (position):")
-print(f"  Neural KF (unsupervised): mean={rmse_neural.mean():.3f}, final={rmse_neural[-1]:.3f}")
-print(f"  UKF (knows true F,Q):     mean={rmse_ukf.mean():.3f}, final={rmse_ukf[-1]:.3f}")
+print(f"\nSingle sequence RMSE:")
+print(f"  Neural KF: mean={rmse_neural.mean():.3f}")
+print(f"  UKF:       mean={rmse_ukf.mean():.3f}")
 
 
 # =============================================================================
@@ -243,55 +237,50 @@ print(f"  UKF (knows true F,Q):     mean={rmse_ukf.mean():.3f}, final={rmse_ukf[
 # =============================================================================
 t_plot = np.arange(n_timesteps)
 
-# State comparison
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 labels = ['x (m)', 'vx (m/s)', 'y (m)', 'vy (m/s)']
 
 for i, (ax, lbl) in enumerate(zip(axes.flat, labels)):
     ax.plot(t_plot, gt[:, i], 'k-', lw=2, label='Ground Truth')
-    ax.plot(t_plot, neural_states[:, i], 'b-', alpha=0.8, label='Neural KF (unsup.)')
-    ax.plot(t_plot, ukf_states[:, i], 'r--', alpha=0.8, label='UKF (knows F,Q)')
+    ax.plot(t_plot, neural_states[:, i], 'b-', alpha=0.8, label='Neural KF v7')
+    ax.plot(t_plot, ukf_states[:, i], 'r--', alpha=0.8, label='UKF')
     ax.set_xlabel('Time Step')
     ax.set_ylabel(lbl)
     ax.legend()
     ax.grid(True)
-    ax.set_title(f'State: {lbl}')
 
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'state_comparison.png'), dpi=150)
 plt.close()
 
-# XY trajectory
 plt.figure(figsize=(8, 8))
 plt.plot(gt[:, 0], gt[:, 2], 'k-', lw=2, label='Ground Truth')
-plt.plot(neural_states[:, 0], neural_states[:, 2], 'b-', alpha=0.8, label='Neural KF (unsup.)')
-plt.plot(ukf_states[:, 0], ukf_states[:, 2], 'r--', alpha=0.8, label='UKF (knows F,Q)')
+plt.plot(neural_states[:, 0], neural_states[:, 2], 'b-', alpha=0.8, label='Neural KF v7')
+plt.plot(ukf_states[:, 0], ukf_states[:, 2], 'r--', alpha=0.8, label='UKF')
 plt.plot(0, 0, 'g^', ms=10, label='Radar 1')
 plt.plot(RADAR_BASELINE, 0, 'm^', ms=10, label='Radar 2')
 plt.xlabel('X (m)')
 plt.ylabel('Y (m)')
 plt.legend()
 plt.grid(True)
-plt.title('XY Trajectory - Fully Unsupervised Learning')
+plt.title('XY Trajectory')
 plt.axis('equal')
 plt.savefig(os.path.join(output_dir, 'xy_trajectory.png'), dpi=150)
 plt.close()
 
-# RMSE
 plt.figure(figsize=(10, 5))
-plt.plot(t_plot, rmse_neural, 'b-', lw=2, label='Neural KF (unsupervised)')
-plt.plot(t_plot, rmse_ukf, 'r--', lw=2, label='UKF (knows F,Q)')
+plt.plot(t_plot, rmse_neural, 'b-', lw=2, label='Neural KF v7')
+plt.plot(t_plot, rmse_ukf, 'r--', lw=2, label='UKF')
 plt.xlabel('Time Step')
 plt.ylabel('Position RMSE (m)')
 plt.legend()
 plt.grid(True)
-plt.title('Position RMSE vs Time')
 plt.savefig(os.path.join(output_dir, 'rmse_comparison.png'), dpi=150)
 plt.close()
 
 
 # =============================================================================
-# MULTI-SEQUENCE EVALUATION
+# MULTI-SEQUENCE
 # =============================================================================
 print("\n" + "="*60)
 print("MULTI-SEQUENCE EVALUATION")
@@ -300,7 +289,7 @@ print("="*60)
 neural_rmse_all = []
 ukf_rmse_all = []
 
-for seq_idx in range(min(50, n_test)):
+for seq_idx in range(50):
     n_states, _ = neural_kf.run(z_test[seq_idx], x0_mean, P0, h_torch)
     n_states = n_states[0]
     u_states, _ = ukf.run(z_test[seq_idx], x0_mean, P0)
@@ -309,51 +298,60 @@ for seq_idx in range(min(50, n_test)):
     neural_rmse_all.append(np.sqrt(np.mean((n_states[:, [0,2]] - g[:, [0,2]])**2)))
     ukf_rmse_all.append(np.sqrt(np.mean((u_states[:, [0,2]] - g[:, [0,2]])**2)))
 
-print(f"\nAverage RMSE over {len(neural_rmse_all)} sequences:")
-print(f"  Neural KF (unsupervised): {np.mean(neural_rmse_all):.3f} ± {np.std(neural_rmse_all):.3f}")
-print(f"  UKF (knows true F,Q):     {np.mean(ukf_rmse_all):.3f} ± {np.std(ukf_rmse_all):.3f}")
+print(f"Average RMSE over 50 sequences:")
+print(f"  Neural KF v7: {np.mean(neural_rmse_all):.3f} ± {np.std(neural_rmse_all):.3f}")
+print(f"  UKF:          {np.mean(ukf_rmse_all):.3f} ± {np.std(ukf_rmse_all):.3f}")
 
-# Box plot comparison
 plt.figure(figsize=(8, 6))
-plt.boxplot([neural_rmse_all, ukf_rmse_all], labels=['Neural KF\n(unsupervised)', 'UKF\n(knows F,Q)'])
+plt.boxplot([neural_rmse_all, ukf_rmse_all], labels=['Neural KF v7', 'UKF'])
 plt.ylabel('Position RMSE (m)')
-plt.title('RMSE Distribution over Test Sequences')
+plt.title('RMSE Distribution')
 plt.grid(True, axis='y')
 plt.savefig(os.path.join(output_dir, 'rmse_boxplot.png'), dpi=150)
 plt.close()
-
-print(f"\nAll saved to: {output_dir}")
 
 
 # =============================================================================
 # ANALYZE LEARNED DYNAMICS
 # =============================================================================
 print("\n" + "="*60)
-print("ANALYZING LEARNED DYNAMICS")
+print("LEARNED DYNAMICS ANALYSIS")
 print("="*60)
 
-# Test what the mean network learned
 mean_net.eval()
 with torch.no_grad():
-    # Test on a few sample states
     test_states = torch.tensor([
-        [100.0, 1.0, 50.0, 0.5],   # Typical state
-        [100.0, 2.0, 50.0, 1.0],   # Higher velocity
-        [150.0, 0.5, 80.0, 0.2],   # Different position
+        [100.0, 1.0, 50.0, 0.5],
+        [100.0, 2.0, 50.0, 1.0],
+        [100.0, 0.0, 50.0, 0.0],
+        [100.0, -1.0, 50.0, -0.5],
     ], device=device)
     
     predicted = mean_net(test_states)
     
-    print("\nLearned dynamics test:")
-    print("Input state -> Predicted next state")
+    print("\nLearned dynamics (should learn dt ≈ 0.5):")
+    print("=" * 70)
+    
     for i in range(len(test_states)):
         inp = test_states[i].cpu().numpy()
         out = predicted[i].cpu().numpy()
-        
-        # Compare with true physics
         true_next = F_true @ inp
         
-        print(f"\n  Input:     [{inp[0]:.1f}, {inp[1]:.2f}, {inp[2]:.1f}, {inp[3]:.2f}]")
-        print(f"  Learned:   [{out[0]:.1f}, {out[1]:.2f}, {out[2]:.1f}, {out[3]:.2f}]")
-        print(f"  True (Fx): [{true_next[0]:.1f}, {true_next[1]:.2f}, {true_next[2]:.1f}, {true_next[3]:.2f}]")
-        print(f"  Difference: [{out[0]-true_next[0]:.2f}, {out[1]-true_next[1]:.3f}, {out[2]-true_next[2]:.2f}, {out[3]-true_next[3]:.3f}]")
+        # Compute implied dt from position change
+        if abs(inp[1]) > 0.1:
+            implied_dt_x = (out[0] - inp[0]) / inp[1]
+        else:
+            implied_dt_x = float('nan')
+        
+        if abs(inp[3]) > 0.1:
+            implied_dt_y = (out[2] - inp[2]) / inp[3]
+        else:
+            implied_dt_y = float('nan')
+        
+        print(f"\nInput: x={inp[0]:.1f}, vx={inp[1]:.1f}, y={inp[2]:.1f}, vy={inp[3]:.1f}")
+        print(f"  Learned next:  x={out[0]:.2f}, vx={out[1]:.2f}, y={out[2]:.2f}, vy={out[3]:.2f}")
+        print(f"  True next:     x={true_next[0]:.2f}, vx={true_next[1]:.2f}, y={true_next[2]:.2f}, vy={true_next[3]:.2f}")
+        print(f"  Implied dt_x: {implied_dt_x:.3f}, dt_y: {implied_dt_y:.3f} (true: 0.5)")
+        print(f"  Vel change: dvx={out[1]-inp[1]:.3f}, dvy={out[3]-inp[3]:.3f} (should be ~0)")
+
+print(f"\nAll saved to: {output_dir}")

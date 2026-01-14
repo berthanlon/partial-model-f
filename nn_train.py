@@ -1,184 +1,193 @@
-# nn_train_v6.py
+# nn_train_v7.py
 """
-FULLY UNSUPERVISED Neural Kalman Filter - v6
+FULLY UNSUPERVISED Neural Kalman Filter - v7
 
-NO KNOWN DYNAMICS (F matrix not used)
+Key improvements over v6:
+1. Structured state network: separate position and velocity processing
+2. Explicit velocity integration bias (helps learn x += v*dt)
+3. Better gradient clipping and stability
+4. Detached covariance input to prevent gradient explosion through P
 
-The neural networks must learn:
-1. State transition dynamics from data
-2. Process noise covariance
-
-This is harder and requires:
-- More training data
-- Longer training
-- Careful architecture design
-- Curriculum learning (short sequences first)
-
-Key insight: We use an RNN-style approach where the network sees
-the previous state and must predict the next state distribution.
+The network must learn:
+- Position update: x_next = x + f(v) where f(v) ≈ v*dt
+- Velocity update: v_next = g(v) where g(v) ≈ v (persistence)
 """
 import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
+import torch.nn.functional as Func
 
 
 # =============================================================================
-# NETWORKS - FULLY LEARNED (NO F MATRIX)
+# NETWORKS - STRUCTURED FOR DYNAMICS LEARNING
 # =============================================================================
 
-class MeanNetUnsupervised(nn.Module):
+class MeanNetStructured(nn.Module):
     """
-    State prediction network - learns dynamics from scratch.
+    Structured state prediction that biases toward constant-velocity dynamics.
     
-    x_pred = f_nn(x_prev)
+    State: [x, vx, y, vy]
     
-    Architecture designed to learn constant-velocity-like dynamics:
-    - Residual connection (identity + learned delta)
-    - Separate processing for position and velocity components
+    Architecture encourages:
+    - x_next = x + velocity_contribution(vx)
+    - vx_next = vx + small_correction
+    - Same for y, vy
+    
+    The network learns the dt implicitly through the velocity contribution.
     """
-    def __init__(self, nx, hidden=128, layers=3):
+    def __init__(self, nx, hidden=64):
         super().__init__()
         self.nx = nx
         
-        # Main network
-        modules = []
-        prev = nx
-        for i in range(layers):
-            modules.append(nn.Linear(prev, hidden))
-            modules.append(nn.LayerNorm(hidden))
-            modules.append(nn.ELU())  # ELU for smoother gradients
-            prev = hidden
-        modules.append(nn.Linear(hidden, nx))
-        self.net = nn.Sequential(*modules)
+        # Velocity-to-position network: learns v*dt relationship
+        # Input: velocity (vx or vy), Output: position delta
+        self.vel_to_pos = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1)
+        )
         
-        # Initialize for near-identity at start
-        self._init_weights()
+        # Velocity update network: learns velocity persistence/change
+        # Input: velocity, Output: velocity delta (should be ~0 for CV model)
+        self.vel_update = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1)
+        )
+        
+        # Initialize vel_to_pos to approximate identity (v*1 = v)
+        # This gives a starting point close to dt=1
+        self._init_vel_to_pos()
+        
+        # Initialize vel_update to output ~0 (velocity persists)
+        self._init_vel_update()
     
-    def _init_weights(self):
-        for m in self.net:
+    def _init_vel_to_pos(self):
+        """Initialize to approximate f(v) ≈ v (identity-ish)."""
+        for m in self.vel_to_pos:
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.5)
+                nn.init.xavier_normal_(m.weight, gain=0.5)
                 nn.init.zeros_(m.bias)
-        # Last layer very small
-        nn.init.normal_(self.net[-1].weight, 0, 0.01)
-        nn.init.zeros_(self.net[-1].bias)
+        # Last layer: small weights, will learn the dt scaling
+        nn.init.normal_(self.vel_to_pos[-1].weight, mean=0.5, std=0.1)
+        nn.init.zeros_(self.vel_to_pos[-1].bias)
+    
+    def _init_vel_update(self):
+        """Initialize to output ~0 (velocity doesn't change much)."""
+        for m in self.vel_update:
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
     
     def forward(self, x):
         """
-        x: (B, nx) = [x, vx, y, vy]
-        returns: x_pred (B, nx)
+        x: (B, 4) = [x, vx, y, vy]
         """
-        # Network predicts the full next state
-        # Use residual connection to help learning
-        delta = self.net(x)
+        B = x.shape[0]
         
-        # Residual: x_next = x_prev + delta
-        # This biases toward identity initially, network learns the correction
-        return x + delta
+        pos_x, vel_x = x[:, 0:1], x[:, 1:2]
+        pos_y, vel_y = x[:, 2:3], x[:, 3:4]
+        
+        # Position update: x_new = x + f(vx)
+        # The network learns f(v) ≈ v * dt
+        dx = self.vel_to_pos(vel_x)
+        dy = self.vel_to_pos(vel_y)
+        
+        pos_x_new = pos_x + dx
+        pos_y_new = pos_y + dy
+        
+        # Velocity update: v_new = v + g(v)
+        # The network learns g(v) ≈ 0 for constant velocity
+        # Clamp the velocity delta to prevent runaway
+        dvx = torch.clamp(self.vel_update(vel_x), -0.5, 0.5)
+        dvy = torch.clamp(self.vel_update(vel_y), -0.5, 0.5)
+        
+        vel_x_new = vel_x + dvx
+        vel_y_new = vel_y + dvy
+        
+        return torch.cat([pos_x_new, vel_x_new, pos_y_new, vel_y_new], dim=1)
 
 
-class CovNetUnsupervised(nn.Module):
+class CovNetSimple(nn.Module):
     """
-    Covariance prediction via Cholesky - learns Q from scratch.
+    Simplified covariance prediction.
     
-    P_pred = L @ L^T
+    Instead of complex learning, use a simpler approach:
+    - Learn a base Cholesky factor
+    - Scale it based on input covariance diagonal
     
-    The network learns what the predicted covariance should be
-    based on the previous covariance.
+    This is more stable and still allows adaptation.
     """
-    def __init__(self, nx, hidden=128, layers=3, 
-                 min_var=0.01, max_var=1000.0):
+    def __init__(self, nx, init_std=1.0):
         super().__init__()
         self.nx = nx
-        self.min_var = min_var
-        self.max_var = max_var
         
-        self.n_diag = nx
-        self.n_lower = nx * (nx - 1) // 2
-        self.n_out = self.n_diag + self.n_lower
+        # Learnable Cholesky diagonal (log scale for positivity)
+        self.log_L_diag = nn.Parameter(torch.zeros(nx))
         
-        # Input: diagonal of P in log space + lower triangle
-        n_input = nx + self.n_lower
+        # Learnable lower triangle
+        n_lower = nx * (nx - 1) // 2
+        self.L_lower = nn.Parameter(torch.zeros(n_lower))
         
-        modules = []
-        prev = n_input
-        for _ in range(layers):
-            modules.append(nn.Linear(prev, hidden))
-            modules.append(nn.LayerNorm(hidden))
-            modules.append(nn.ELU())
-            prev = hidden
-        modules.append(nn.Linear(hidden, self.n_out))
-        self.net = nn.Sequential(*modules)
+        # Small network to adapt based on input
+        self.adapt_net = nn.Sequential(
+            nn.Linear(nx, 32),
+            nn.Tanh(),
+            nn.Linear(32, nx)
+        )
+        
+        # Initialize
+        nn.init.constant_(self.log_L_diag, np.log(init_std))
+        nn.init.zeros_(self.L_lower)
+        
+        for m in self.adapt_net:
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
         
         # Indices
         self.register_buffer('tril_idx', torch.tril_indices(nx, nx, offset=-1))
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.5)
-                nn.init.zeros_(m.bias)
-        # Initialize output bias for reasonable starting covariance
-        # We want L_diag ~ 1.0 initially, so softplus^{-1}(1) ~ 0.54
-        nn.init.constant_(self.net[-1].bias[:self.n_diag], 0.5)
-        nn.init.zeros_(self.net[-1].bias[self.n_diag:])
     
     def forward(self, P_prev):
         B = P_prev.shape[0]
         device = P_prev.device
         
-        # Extract features from P_prev
-        diag = torch.diagonal(P_prev, dim1=-2, dim2=-1)
-        log_diag = torch.log(diag.clamp(min=1e-6))
+        # Get diagonal of input (detached to prevent gradient explosion)
+        diag_in = torch.diagonal(P_prev.detach(), dim1=-2, dim2=-1)
+        log_diag_in = torch.log(diag_in.clamp(min=1e-6))
         
-        if self.n_lower > 0:
-            lower = P_prev[:, self.tril_idx[0], self.tril_idx[1]]
-            # Normalize lower by diagonal scale
-            scale = torch.sqrt(diag[:, self.tril_idx[0]] * diag[:, self.tril_idx[1]]).clamp(min=1e-6)
-            lower_norm = lower / scale
-            features = torch.cat([log_diag, lower_norm], dim=-1)
-        else:
-            features = log_diag
+        # Adaptive scaling based on input
+        adapt = self.adapt_net(log_diag_in)  # (B, nx)
         
-        # Network output
-        out = self.net(features)
+        # Build L diagonal: base + adaptation
+        L_diag = torch.exp(self.log_L_diag + 0.1 * adapt)
+        L_diag = torch.clamp(L_diag, min=0.01, max=100.0)
         
-        raw_diag = out[:, :self.n_diag]
-        raw_lower = out[:, self.n_diag:]
-        
-        # Diagonal of L: positive via softplus, bounded
-        L_diag = F.softplus(raw_diag)
-        L_diag = torch.clamp(L_diag, 
-                            min=np.sqrt(self.min_var), 
-                            max=np.sqrt(self.max_var))
-        
-        # Lower triangle: bounded
-        L_lower = torch.tanh(raw_lower) * L_diag[:, self.tril_idx[0]] * 0.5
-        
-        # Build L
+        # Build L matrix
         L = torch.zeros(B, self.nx, self.nx, device=device)
         L[:, range(self.nx), range(self.nx)] = L_diag
-        if self.n_lower > 0:
-            L[:, self.tril_idx[0], self.tril_idx[1]] = L_lower
         
-        # P = L @ L^T (guaranteed SPD)
+        if self.L_lower.numel() > 0:
+            # Lower triangle: scaled by diagonal
+            scale = torch.sqrt(L_diag[:, self.tril_idx[0]] * L_diag[:, self.tril_idx[1]])
+            L_low = torch.tanh(self.L_lower) * 0.3 * scale
+            L[:, self.tril_idx[0], self.tril_idx[1]] = L_low
+        
+        # P = L @ L^T
         P = L @ L.transpose(-1, -2)
         
         return P
 
 
 # =============================================================================
-# UKF CORE
+# UKF CORE (same as before)
 # =============================================================================
 
 class UKFCore:
-    """UKF update equations."""
-    
     def __init__(self, nx, nz, R, device, alpha=0.001, beta=2.0, kappa=0.0):
         self.nx = nx
         self.nz = nz
@@ -188,7 +197,6 @@ class UKFCore:
         if self.R.dim() == 2:
             self.R = self.R.unsqueeze(0)
         
-        # UKF weights
         lmbda = alpha**2 * (nx + kappa) - nx
         self.gamma = np.sqrt(nx + lmbda)
         
@@ -204,16 +212,18 @@ class UKFCore:
         self.Wc = Wc
         self.n_sigma = n_sigma
     
-    def _sigma_points(self, x, P):
-        B = x.shape[0]
-        
+    def _safe_cholesky(self, P):
         P_reg = P + 1e-4 * torch.eye(self.nx, device=self.device)
         try:
-            L = torch.linalg.cholesky(P_reg)
+            return torch.linalg.cholesky(P_reg)
         except:
             eigvals, eigvecs = torch.linalg.eigh(P_reg)
             eigvals = torch.clamp(eigvals, min=1e-4)
-            L = eigvecs @ torch.diag_embed(torch.sqrt(eigvals))
+            return eigvecs @ torch.diag_embed(torch.sqrt(eigvals))
+    
+    def _sigma_points(self, x, P):
+        B = x.shape[0]
+        L = self._safe_cholesky(P)
         
         sigma = torch.zeros(B, self.n_sigma, self.nx, device=self.device)
         sigma[:, 0] = x
@@ -258,6 +268,7 @@ class UKFCore:
         P_post = P_pred - K @ S @ K.transpose(-1, -2)
         P_post = 0.5 * (P_post + P_post.transpose(-1, -2))
         
+        # Project to SPD
         eigvals, eigvecs = torch.linalg.eigh(P_post)
         eigvals = torch.clamp(eigvals, min=1e-4)
         P_post = eigvecs @ torch.diag_embed(eigvals) @ eigvecs.transpose(-1, -2)
@@ -269,40 +280,37 @@ class UKFCore:
 # LOSS
 # =============================================================================
 
-def nll_loss(y, S, clamp_max=100.0):
-    """NLL with clamping for stability."""
+def nll_loss(y, S):
+    """NLL with stability."""
     eigvals, eigvecs = torch.linalg.eigh(S)
-    eigvals = torch.clamp(eigvals, min=1e-6)
+    eigvals = torch.clamp(eigvals, min=1e-6, max=1e6)
     
     log_det = torch.sum(torch.log(eigvals), dim=-1)
-    log_det = torch.clamp(log_det, min=-50, max=50)
+    log_det = torch.clamp(log_det, -100, 100)
     
     y_rot = (eigvecs.transpose(-1, -2) @ y.unsqueeze(-1)).squeeze(-1)
     mahal = torch.sum(y_rot**2 / eigvals, dim=-1)
-    mahal = torch.clamp(mahal, max=clamp_max)
+    mahal = torch.clamp(mahal, max=100.0)
     
     return torch.mean(log_det + mahal)
 
 
 # =============================================================================
-# TRAINING - CURRICULUM LEARNING
+# TRAINING
 # =============================================================================
 
-def train_unsupervised_neural_kf(
+def train_unsupervised_v7(
     z_train, R, h_fn,
     x0, P0,
     nx, nz,
     epochs=500,
     lr=1e-3,
     device='cpu',
-    checkpoint_path='neural_kf_unsupervised.pth',
-    curriculum=True,
+    checkpoint_path='neural_kf_v7.pth',
     verbose=True
 ):
     """
-    Train fully unsupervised Neural KF.
-    
-    Uses curriculum learning: start with short sequences, gradually increase.
+    Train v7 with structured dynamics learning.
     """
     device = torch.device(device)
     
@@ -310,29 +318,26 @@ def train_unsupervised_neural_kf(
     B, T_max, _ = z_train.shape
     
     if verbose:
-        print(f"[Train] Fully Unsupervised Neural KF")
+        print(f"[Train] v7 - Structured Dynamics Learning")
         print(f"[Train] B={B}, T_max={T_max}, nx={nx}, nz={nz}")
-        print(f"[Train] Epochs={epochs}, LR={lr}")
-        print(f"[Train] Curriculum learning: {curriculum}")
     
     x0_t = torch.as_tensor(x0, dtype=torch.float32, device=device)
     P0_t = torch.as_tensor(P0, dtype=torch.float32, device=device)
     
-    # Networks - no F matrix!
-    mean_net = MeanNetUnsupervised(nx, hidden=128, layers=3).to(device)
-    cov_net = CovNetUnsupervised(nx, hidden=128, layers=3).to(device)
+    # Networks
+    mean_net = MeanNetStructured(nx, hidden=64).to(device)
+    cov_net = CovNetSimple(nx, init_std=1.0).to(device)
     
     # UKF
     ukf = UKFCore(nx, nz, R, device)
     
-    # Optimizer with weight decay for regularization
-    params = list(mean_net.parameters()) + list(cov_net.parameters())
-    optimizer = optim.AdamW(params, lr=lr, weight_decay=1e-5)
+    # Separate optimizers for better control
+    opt_mean = optim.Adam(mean_net.parameters(), lr=lr)
+    opt_cov = optim.Adam(cov_net.parameters(), lr=lr * 0.5)
     
-    # Learning rate schedule
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=100, T_mult=2, eta_min=1e-6
-    )
+    # Schedulers
+    sched_mean = optim.lr_scheduler.ReduceLROnPlateau(opt_mean, factor=0.5, patience=50, min_lr=1e-6)
+    sched_cov = optim.lr_scheduler.ReduceLROnPlateau(opt_cov, factor=0.5, patience=50, min_lr=1e-6)
     
     history = {'loss': [], 'best_epoch': 0, 'T_curriculum': []}
     best_loss = float('inf')
@@ -340,72 +345,63 @@ def train_unsupervised_neural_kf(
     for ep in range(epochs):
         mean_net.train()
         cov_net.train()
-        optimizer.zero_grad()
+        opt_mean.zero_grad()
+        opt_cov.zero_grad()
         
-        # Curriculum: gradually increase sequence length
-        if curriculum:
-            # Start with T=3, increase every 50 epochs
-            T = min(3 + (ep // 50) * 2, T_max)
-        else:
-            T = T_max
-        
+        # Curriculum: start short
+        T = min(3 + ep // 30, T_max)
         history['T_curriculum'].append(T)
         
-        # Random subsequence start for variety
+        # Random start for variety
         if T < T_max:
-            max_start = T_max - T
-            start_idx = torch.randint(0, max_start + 1, (1,)).item()
+            start = np.random.randint(0, T_max - T + 1)
         else:
-            start_idx = 0
+            start = 0
         
         # Initialize
         x = x0_t.unsqueeze(0).expand(B, -1).clone()
         P = P0_t.unsqueeze(0).expand(B, -1, -1).clone()
         
         total_loss = 0.0
-        valid_steps = 0
+        valid = 0
         
         for t in range(T):
-            t_actual = start_idx + t
-            
-            # Neural prediction (no F matrix!)
             x_pred = mean_net(x)
             P_pred = cov_net(P)
             
-            # UKF update
-            x, P, y, S = ukf.update(x_pred, P_pred, z_train[:, t_actual], h_fn)
+            x, P, y, S = ukf.update(x_pred, P_pred, z_train[:, start + t], h_fn)
             
-            # NLL loss
             loss_t = nll_loss(y, S)
             
-            if torch.isnan(loss_t) or torch.isinf(loss_t):
-                continue
-            
-            total_loss = total_loss + loss_t
-            valid_steps += 1
+            if not (torch.isnan(loss_t) or torch.isinf(loss_t)):
+                total_loss = total_loss + loss_t
+                valid += 1
         
-        if valid_steps == 0:
+        if valid == 0:
+            if verbose:
+                print(f"[Train] Ep {ep}: all NaN, skipping")
             continue
         
-        loss = total_loss / valid_steps
-        
-        # Backward
+        loss = total_loss / valid
         loss.backward()
         
-        # Gradient clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
+        # Separate gradient clipping
+        gn_mean = torch.nn.utils.clip_grad_norm_(mean_net.parameters(), 5.0)
+        gn_cov = torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 5.0)
         
-        # Skip if gradient explosion
-        if grad_norm > 100:
-            if verbose and ep % 50 == 0:
-                print(f"[Train] Ep {ep}: gradient explosion ({grad_norm:.1f}), skipping")
+        if gn_mean > 50 or gn_cov > 50:
+            if verbose and ep % 100 == 0:
+                print(f"[Train] Ep {ep}: grad explosion (mean={gn_mean:.1f}, cov={gn_cov:.1f})")
             continue
         
-        optimizer.step()
-        scheduler.step()
+        opt_mean.step()
+        opt_cov.step()
         
         loss_val = loss.item()
         history['loss'].append(loss_val)
+        
+        sched_mean.step(loss_val)
+        sched_cov.step(loss_val)
         
         if loss_val < best_loss:
             best_loss = loss_val
@@ -414,12 +410,10 @@ def train_unsupervised_neural_kf(
                 'mean': mean_net.state_dict(),
                 'cov': cov_net.state_dict(),
                 'nx': nx,
-                'nz': nz,
             }, checkpoint_path)
         
-        if verbose and ep % 50 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"Ep {ep:4d} | Loss: {loss_val:.4f} | Best: {best_loss:.4f} @ {history['best_epoch']} | T={T} | LR: {current_lr:.2e}")
+        if verbose and ep % 100 == 0:
+            print(f"Ep {ep:4d} | Loss: {loss_val:.4f} | Best: {best_loss:.4f} @ {history['best_epoch']} | T={T}")
     
     # Load best
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -427,7 +421,7 @@ def train_unsupervised_neural_kf(
     cov_net.load_state_dict(ckpt['cov'])
     
     if verbose:
-        print(f"\n[Train] Done. Best loss: {best_loss:.4f} @ epoch {history['best_epoch']}")
+        print(f"\n[Train] Done. Best: {best_loss:.4f} @ epoch {history['best_epoch']}")
     
     return mean_net, cov_net, history
 
@@ -436,20 +430,16 @@ def train_unsupervised_neural_kf(
 # INFERENCE
 # =============================================================================
 
-class NeuralKFUnsupervised:
-    """Fully unsupervised Neural KF for inference."""
-    
+class NeuralKFv7:
     def __init__(self, mean_net, cov_net, R, device):
         self.mean_net = mean_net.to(device)
         self.cov_net = cov_net.to(device)
         self.device = device
         self.nx = mean_net.nx
         self.nz = R.shape[0]
-        
         self.ukf = UKFCore(self.nx, self.nz, R, device)
     
     def run(self, z_seq, x0, P0, h_fn):
-        """Run filter on sequence."""
         self.mean_net.eval()
         self.cov_net.eval()
         
@@ -467,8 +457,7 @@ class NeuralKFUnsupervised:
         if P.dim() == 2:
             P = P.unsqueeze(0).expand(B, -1, -1)
         
-        states = []
-        covs = []
+        states, covs = [], []
         
         with torch.no_grad():
             for t in range(T):
@@ -481,15 +470,14 @@ class NeuralKFUnsupervised:
         return np.array(states).transpose(1, 0, 2), np.array(covs).transpose(1, 0, 2, 3)
 
 
-def load_unsupervised_neural_kf(path, R, device):
-    """Load trained unsupervised model."""
+def load_v7(path, R, device):
     ckpt = torch.load(path, map_location=device)
     nx = ckpt['nx']
     
-    mean_net = MeanNetUnsupervised(nx).to(device)
-    cov_net = CovNetUnsupervised(nx).to(device)
+    mean_net = MeanNetStructured(nx).to(device)
+    cov_net = CovNetSimple(nx).to(device)
     
     mean_net.load_state_dict(ckpt['mean'])
     cov_net.load_state_dict(ckpt['cov'])
     
-    return NeuralKFUnsupervised(mean_net, cov_net, R, device)
+    return NeuralKFv7(mean_net, cov_net, R, device)
