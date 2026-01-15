@@ -44,7 +44,7 @@ P0 = np.diag([10.0, 1.0, 10.0, 1.0]).astype(np.float32)
 
 n_train = 2000
 n_test = 200
-n_timesteps = 60
+n_timesteps = 20
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
