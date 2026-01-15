@@ -36,14 +36,14 @@ Q_true = np.array([
     [0, 0, T_sample**2/2, T_sample]
 ], dtype=np.float32) * sigma_u**2
 
-sigma_r = 2.0
+sigma_r = 1.0
 R_true = np.eye(nz, dtype=np.float32) * sigma_r**2
 
 x0_mean = np.array([100.0, 1.0, 50.0, 0.5], dtype=np.float32)
 P0 = np.diag([10.0, 1.0, 10.0, 1.0]).astype(np.float32)
 
 n_train = 2000
-n_test = 200
+n_test = 500
 n_timesteps = 20
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -332,3 +332,64 @@ with torch.no_grad():
               f"dvx={out[1]-inp[1]:+.4f}, dvy={out[3]-inp[3]:+.4f}")
 
 print(f"\nSaved to: {output_dir}")
+
+def plot_velocity_diagnosis(neural_kf, z_test, x0, P0, h_fn, index=0):
+    """
+    Diagnoses if the velocity jitter is due to the Network or the Filter.
+    """
+    import matplotlib.pyplot as plt
+    
+    # 1. Run the Full Filter (Neural KF)
+    states_filter, _ = neural_kf.run(z_test[index:index+1], x0[index], P0, h_fn)
+    states_filter = states_filter[0] # Shape (T, 4)
+    
+    # 2. Run Open-Loop Prediction (What the Net 'wants' to do without correction)
+    # We manually step the mean_net forward without the UKF update
+    mean_net = neural_kf.mean_net
+    scaler = neural_kf.mean_net.scaler # Access the scaler inside the wrapper
+    
+    # Prepare initial state
+    current_x_phys = torch.tensor(x0[index], device=neural_kf.device).unsqueeze(0)
+    pred_states = [current_x_phys.cpu().numpy()[0]]
+    
+    with torch.no_grad():
+        for t in range(len(z_test[index])):
+            # Normalize
+            x_norm = scaler.normalize(current_x_phys)
+            # Predict
+            x_new_norm = mean_net.net(x_norm) # Access inner net
+            # Denormalize
+            current_x_phys = scaler.denormalize(x_new_norm)
+            pred_states.append(current_x_phys.cpu().numpy()[0])
+            
+    pred_states = np.array(pred_states)
+    
+    # 3. Plotting
+    time = np.arange(len(states_filter)) * 0.5
+    
+    fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot Position X
+    ax[0].plot(time, states_filter[:, 0], 'b-', label='Filter Output (UKF)', linewidth=2)
+    ax[0].plot(time, pred_states[1:, 0], 'r--', label='Pure Net Prediction (Open Loop)', linewidth=2)
+    ax[0].set_title(f"Position X (Trajectory {index})")
+    ax[0].set_xlabel("Time (s)")
+    ax[0].set_ylabel("Position (m)")
+    ax[0].legend()
+    ax[0].grid(True)
+    
+    # Plot Velocity X
+    ax[1].plot(time, states_filter[:, 1], 'b-', label='Filter Velocity', linewidth=2)
+    ax[1].plot(time, pred_states[1:, 1], 'r--', label='Pure Net Velocity', linewidth=2)
+    ax[1].set_title(f"Velocity X (Trajectory {index})")
+    ax[1].set_xlabel("Time (s)")
+    ax[1].set_ylabel("Velocity (m/s)")
+    ax[1].legend()
+    ax[1].grid(True)
+    
+    plt.suptitle("Diagnosis: Is the Network Smooth?", fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+# Example Usage (assuming you have loaded 'neural_kf' and data)
+plot_velocity_diagnosis(neural_kf, z_test, x0_mean, P0, h_torch, index=5)

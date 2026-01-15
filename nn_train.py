@@ -105,7 +105,7 @@ class MeanNetStructured(nn.Module):
         return torch.cat([pos_x+dx, vel_x+dvx, pos_y+dy, vel_y+dvy], dim=1)
 
 class CovNetSimple(nn.Module):
-    def __init__(self, nx, init_std=0.01): # Changed default init to be smaller
+    def __init__(self, nx, init_std=0.000001): # Changed default init to be smaller
         super().__init__()
         self.nx = nx
         # Initialize small to encourage smoothness early on
