@@ -1,4 +1,4 @@
-# test_neural_kf_v10.py
+# test_spd_verification.py
 """Test v10 - Residual architecture."""
 import os
 import numpy as np
@@ -25,7 +25,7 @@ R_true = np.eye(nz, dtype=np.float32) * sigma_r**2
 x0_mean = np.array([100.0, 1.0, 50.0, 0.5], dtype=np.float32)
 P0 = np.diag([10.0, 1.0, 10.0, 1.0]).astype(np.float32)
 
-n_train, n_test, n_timesteps = 2000, 100, 20
+n_train, n_test, n_timesteps = 2000, 100, 100
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
@@ -69,7 +69,7 @@ mean_net, cov_net, scaler, history = train_v10(
     z_train=z_train, R=R_true, h_fn=h_torch,
     x0=x0_mean, P0=P0, nx=nx, nz=nz,
     dt=dt, pos_scale=100.0, vel_scale=5.0,
-    epochs=1000, lr=1e-3, device=str(device),
+    epochs=400, lr=1e-3, device=str(device),
     checkpoint_path=os.path.join(output_dir, 'neural_kf_v10.pth'),
     tbptt_len=5, verbose=True
 )
@@ -82,7 +82,7 @@ plt.grid(True)
 plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=150)
 plt.close()
 
-# UKF Baseline
+# UKF Baseline with robust covariance handling
 class UKFBaseline:
     def __init__(self, F, Q, R, h_fn, alpha=0.001, beta=2.0, kappa=0.0):
         self.F, self.Q, self.R, self.h = F, Q, R, h_fn
@@ -97,6 +97,13 @@ class UKFBaseline:
         self.Wc[1:] = 0.5 / (self.nx + lmbda)
         self.n_sigma = n
     
+    def _ensure_spd(self, P):
+        """Ensure matrix is symmetric positive definite."""
+        P = 0.5 * (P + P.T)  # Symmetrize
+        eigvals, eigvecs = np.linalg.eigh(P)
+        eigvals = np.maximum(eigvals, 1e-6)  # Clamp eigenvalues
+        return eigvecs @ np.diag(eigvals) @ eigvecs.T
+    
     def run(self, z_seq, x0, P0):
         T = z_seq.shape[0]
         xs, Ps = np.zeros((T, self.nx)), np.zeros((T, self.nx, self.nx))
@@ -104,7 +111,14 @@ class UKFBaseline:
         for t in range(T):
             x_pred = self.F @ x
             P_pred = self.F @ P @ self.F.T + self.Q
-            L = np.linalg.cholesky(P_pred + 1e-6 * np.eye(self.nx))
+            P_pred = self._ensure_spd(P_pred)
+            
+            try:
+                L = np.linalg.cholesky(P_pred + 1e-6 * np.eye(self.nx))
+            except:
+                P_pred = self._ensure_spd(P_pred + 1e-4 * np.eye(self.nx))
+                L = np.linalg.cholesky(P_pred)
+            
             sigma = np.zeros((self.n_sigma, self.nx))
             sigma[0] = x_pred
             for i in range(self.nx):
@@ -120,6 +134,7 @@ class UKFBaseline:
             K = C @ np.linalg.inv(S)
             x = x_pred + K @ (z_seq[t] - z_hat)
             P = P_pred - K @ S @ K.T
+            P = self._ensure_spd(P)  # Ensure SPD after update
             xs[t], Ps[t] = x, P
         return xs, Ps
 
@@ -201,8 +216,8 @@ for seq_idx in range(50):
     ukf_rmse_all.append(np.mean(ukf_rmse_t))
 
 print(f"Average RMSE over 50 sequences:")
-print(f"  Neural KF v10: {np.mean(neural_rmse_all):.3f} ± {np.std(neural_rmse_all):.3f}")
-print(f"  UKF:           {np.mean(ukf_rmse_all):.3f} ± {np.std(ukf_rmse_all):.3f}")
+print(f"  Neural KF v10: {np.mean(neural_rmse_all):.3f} +/- {np.std(neural_rmse_all):.3f}")
+print(f"  UKF:           {np.mean(ukf_rmse_all):.3f} +/- {np.std(ukf_rmse_all):.3f}")
 
 # Box plot
 plt.figure(figsize=(8, 6))
@@ -212,10 +227,9 @@ plt.grid(True, axis='y')
 plt.savefig(os.path.join(output_dir, 'rmse_boxplot.png'), dpi=150)
 plt.close()
 
-# NEW: RMSE vs Time across all sequences
+# RMSE vs Time across all sequences
 plt.figure(figsize=(12, 5))
 
-# Mean and std across sequences for each timestep
 neural_mean = np.mean(neural_rmse_per_t, axis=0)
 neural_std = np.std(neural_rmse_per_t, axis=0)
 ukf_mean = np.mean(ukf_rmse_per_t, axis=0)
@@ -228,11 +242,10 @@ plt.plot(t_plot, ukf_mean, 'r--', lw=2, label='UKF')
 plt.fill_between(t_plot, ukf_mean - ukf_std, ukf_mean + ukf_std, alpha=0.3, color='red')
 plt.xlabel('Time Step')
 plt.ylabel('Position RMSE (m)')
-plt.title('Mean RMSE ± Std over 50 Sequences')
+plt.title('Mean RMSE +/- Std over 50 Sequences')
 plt.legend()
 plt.grid(True)
 
-# Median with percentiles (more robust to outliers)
 plt.subplot(1, 2, 2)
 neural_median = np.median(neural_rmse_per_t, axis=0)
 neural_p25 = np.percentile(neural_rmse_per_t, 25, axis=0)
@@ -255,9 +268,9 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'rmse_vs_time_all_sequences.png'), dpi=150)
 plt.close()
 
-print(f"\nPer-timestep stats (t=0, t=10, t=19):")
-for t_idx in [0, 10, 19]:
-    print(f"  t={t_idx}: Neural={neural_mean[t_idx]:.2f}±{neural_std[t_idx]:.2f}, UKF={ukf_mean[t_idx]:.2f}±{ukf_std[t_idx]:.2f}")
+print(f"\nPer-timestep stats (t=0, t=10, t=49):")
+for t_idx in [0, 10, 49]:
+    print(f"  t={t_idx}: Neural={neural_mean[t_idx]:.2f}+/-{neural_std[t_idx]:.2f}, UKF={ukf_mean[t_idx]:.2f}+/-{ukf_std[t_idx]:.2f}")
 
 # Dynamics analysis
 print("\n" + "="*60)
@@ -265,31 +278,31 @@ print("LEARNED DYNAMICS")
 print("="*60)
 
 mean_net.eval()
-dt_norm = dt * 5.0 / 100.0  # vel_scale / pos_scale
 
 with torch.no_grad():
-    test_norm = torch.tensor([
-        [1.0, 0.2, 0.5, 0.1],
-        [1.0, 0.4, 0.5, 0.2],
-        [1.0, 0.0, 0.5, 0.0],
-        [1.0, -0.2, 0.5, -0.1],
-    ], device=device)
+    # Test in PHYSICAL space (not normalized) since our dynamics work in physical space
+    test_phys = torch.tensor([
+        [100.0, 1.0, 50.0, 0.5],    # typical state
+        [100.0, 2.0, 50.0, 1.0],    # faster
+        [100.0, 0.0, 50.0, 0.0],    # stationary
+        [100.0, -1.0, 50.0, -0.5],  # moving backward
+    ], device=device, dtype=torch.float32)
     
-    pred_norm = mean_net(test_norm)
+    pred_phys = mean_net(test_phys)
     
-    print(f"\nIn NORMALIZED space (dt_norm={dt_norm:.4f}):")
+    print(f"\nIn PHYSICAL space (dt={dt}):")
     print("-" * 70)
     
-    for i in range(len(test_norm)):
-        inp = test_norm[i].cpu().numpy()
-        out = pred_norm[i].cpu().numpy()
+    for i in range(len(test_phys)):
+        inp = test_phys[i].cpu().numpy()
+        out = pred_phys[i].cpu().numpy()
         delta = out - inp
         
-        expected_delta_x = inp[1] * dt_norm
-        expected_delta_y = inp[3] * dt_norm
+        expected_delta_x = inp[1] * dt  # vx * dt
+        expected_delta_y = inp[3] * dt  # vy * dt
         
-        print(f"Input: x={inp[0]:.3f}, vx={inp[1]:.3f}, y={inp[2]:.3f}, vy={inp[3]:.3f}")
-        print(f"  Learned delta:  dx={delta[0]:.4f}, dvx={delta[1]:.4f}, dy={delta[2]:.4f}, dvy={delta[3]:.4f}")
+        print(f"Input: x={inp[0]:.1f}, vx={inp[1]:.2f}, y={inp[2]:.1f}, vy={inp[3]:.2f}")
+        print(f"  Learned delta:  dx={delta[0]:.4f}, dvx={delta[1]:.6f}, dy={delta[2]:.4f}, dvy={delta[3]:.6f}")
         print(f"  Expected delta: dx={expected_delta_x:.4f}, dvx=0.0000, dy={expected_delta_y:.4f}, dvy=0.0000")
         print()
 
