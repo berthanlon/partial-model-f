@@ -1,5 +1,5 @@
 """
-Neural Kalman Filter v10 - STRICT MATH + PHYSICS INIT + STABLE BROADCASTING
+Neural Kalman Filter v10 - STRICT MATH + STABILIZED TRAINING
 
 1. Prediction Mean: x_k|k-1 = m_theta(x_k-1|k-1)
 2. Prediction Cov: P_k|k-1 = C_theta(P_k-1|k-1)
@@ -194,18 +194,12 @@ class UKFCore:
         z_diff = z_sigma - z_hat.unsqueeze(1)
         x_diff = sigma - x_pred.unsqueeze(1)
         
-        # FIX: Avoid in-place += for S to prevent shape mismatch errors
         S = self.R.clone()
-        # Initialize as proper batch tensors
-        batch_size = x_pred.shape[0]
-        
         for i in range(self.n_sigma):
-            # Explicit outer product
             term = z_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2)
-            # Weighted sum (broadcast scalar Wc across batch)
             S = S + self.Wc[i] * term
         
-        C = torch.zeros(batch_size, self.nx, self.nz, device=self.device)
+        C = torch.zeros(x_pred.shape[0], self.nx, self.nz, device=self.device)
         for i in range(self.n_sigma):
             term = x_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2)
             C = C + self.Wc[i] * term
@@ -238,7 +232,11 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu
         {'params': cov_net.parameters(), 'lr': 1e-3}
     ])
     
-    print(f"[Train] v10 Strict Math | m_theta(x) and C_theta(P)")
+    # NEW: Learning Rate Scheduler
+    # Reduces LR by factor of 0.5 if loss doesn't improve for 20 epochs
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
+    
+    print(f"[Train] v10 Stabilized | Scheduler Active")
     
     history = {'loss': [], 'best_epoch': 0}
     best_loss = float('inf')
@@ -281,6 +279,7 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu
             if (t + 1) % tbptt_len == 0:
                 avg_loss = loss_chunk / tbptt_len
                 avg_loss.backward()
+                # NEW: Tighter Clipping
                 torch.nn.utils.clip_grad_norm_(mean_net.parameters(), 0.5)
                 torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 1.0)
                 optimizer.step()
@@ -289,6 +288,9 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu
                 x = x.detach(); P = P.detach()
                 total_loss += avg_loss.item()
                 loss_chunk = 0
+        
+        # Step Scheduler
+        scheduler.step(total_loss)
 
         if ep % 20 == 0:
             print(f"Ep {ep} | Loss: {total_loss:.4f}")
