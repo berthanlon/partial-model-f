@@ -1,14 +1,17 @@
 """
-Neural Kalman Filter v12 - PHYSICS ANCHORED STABILITY
+Neural Kalman Filter v19.1 - STABILIZED DESCENT & COMPLETE
 
-1. Mean Function m_theta(x):
-   - x_pred = F*x + NeuralResidual(x)
-   - Starts as Newton's Laws. Learns Drag/Turns.
+1. Initialization:
+   - MeanNet: Exact Zero (Start as Identity).
+   - CovNet: Medium Stiffness (Softplus(-4.0) -> ~2m uncertainty).
+     *Prevents the "Valley of Death" gradient explosion.*
 
-2. Covariance Function C_theta(P):
-   - P_pred = F*P*F^T + NeuralProcessNoise(P)
-   - Starts as Standard Error Propagation. Learns State-Dependent Noise.
-   - This satisfies C_theta(P) while preventing explosion.
+2. Optimization:
+   - LR: 1e-3 (Prevent overshoot).
+   - Clip: 0.5 (Prevent jumps).
+   
+3. Curriculum:
+   - 100 Epochs Linear Only -> Then MLP -> Then Covariance.
 """
 import os
 import numpy as np
@@ -37,15 +40,18 @@ class StateScaler:
         return D @ P_norm @ D
 
 # =============================================================================
-# 1. PHYSICS-GUIDED MEAN NET
+# 1. MEAN NET (Linear Shortcut)
 # =============================================================================
-class PhysicsGuidedMeanNet(nn.Module):
-    def __init__(self, nx, hidden=64, dt_norm=0.05):
+class MeanNet(nn.Module):
+    def __init__(self, nx, hidden=64):
         super().__init__()
         self.nx = nx
         
-        # 1. The Neural Residual
-        self.residual_net = nn.Sequential(
+        # A. Fast Lane (Linear Physics)
+        self.linear = nn.Linear(nx, nx, bias=False)
+        
+        # B. Slow Lane (Non-linear Residuals)
+        self.mlp = nn.Sequential(
             nn.Linear(nx, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
@@ -53,44 +59,36 @@ class PhysicsGuidedMeanNet(nn.Module):
             nn.Linear(hidden, nx)
         )
         
-        # 2. The Physics Matrix (Constant Velocity)
-        F = torch.eye(nx)
-        F[0, 1] = dt_norm; F[2, 3] = dt_norm
-        self.register_buffer('F_norm', F)
+        # --- INITIALIZATION ---
+        # 1. Init Linear to EXACT ZERO.
+        #    Reason: Even small noise * 100.0 scale = huge physical error.
+        #    We rely on the gradient from the loss to push it from zero.
+        self.linear.weight.data.zero_()
         
-        # Init Residuals to Zero
-        for m in self.residual_net:
+        # 2. Init MLP to Zero
+        for m in self.mlp:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, 0.01)
+                nn.init.xavier_normal_(m.weight, gain=0.01)
                 nn.init.zeros_(m.bias)
+        with torch.no_grad():
+            self.mlp[-1].weight.zero_()
+            self.mlp[-1].bias.zero_()
 
     def forward(self, x):
-        # x_new = F*x + Net(x)
-        x_phys = x @ self.F_norm.T
-        x_corr = self.residual_net(x)
-        return x_phys + x_corr
+        return x + self.linear(x) + self.mlp(x)
 
 # =============================================================================
-# 2. PHYSICS-ANCHORED COVARIANCE NET
+# 2. COVARIANCE NET (Goldilocks Init)
 # =============================================================================
-class PhysicsAnchoredCovNet(nn.Module):
-    """
-    Implements C_theta(P) = F*P*F^T + Q(P)
-    This creates a valid mapping from P_old -> P_new that is STABLE.
-    """
-    def __init__(self, nx, hidden=128, dt_norm=0.05):
+class CovNetFromP(nn.Module):
+    def __init__(self, nx, hidden=128):
         super().__init__()
         self.nx = nx
         
-        # Physics Propagation Matrix
-        F = torch.eye(nx)
-        F[0, 1] = dt_norm; F[2, 3] = dt_norm
-        self.register_buffer('F_norm', F)
+        F_anchor = torch.eye(nx)
+        self.register_buffer('F_anchor', F_anchor)
         
-        # Network learns Q based on P (and optionally x, but let's stick to P)
-        # Input: Flattened P
-        self.n_input = nx * nx 
-        # Output: Cholesky factors of Q (diagonal + lower)
+        self.n_input = nx + (nx * (nx - 1) // 2)
         self.n_diag = nx
         self.n_lower = nx * (nx - 1) // 2
         self.n_output = self.n_diag + self.n_lower
@@ -107,38 +105,40 @@ class PhysicsAnchoredCovNet(nn.Module):
         
         self.register_buffer('tril_idx', torch.tril_indices(nx, nx, offset=-1))
         
-        # Init Q to be small but non-zero
+        # --- MEDIUM STIFFNESS INIT ---
+        # Softplus(-4.0) ~= 0.018
+        # Scaled (x100) ~= 1.8 meters uncertainty.
+        # This is tight enough to encourage physics, but loose enough to prevent explosion.
         with torch.no_grad():
-            self.net[-1].weight.mul_(0.01)
+            self.net[-1].weight.mul_(0.001)
             self.net[-1].bias.zero_()
-            # Initialize diagonals to something reasonable (e.g. 0.01)
-            # Softplus(-3.0) approx 0.05
-            self.net[-1].bias[:self.n_diag].fill_(-3.0)
+            self.net[-1].bias[:self.n_diag].fill_(-4.0)
+
+    def extract_features(self, P):
+        diags = torch.diagonal(P, dim1=1, dim2=2)
+        log_diags = torch.log(torch.clamp(diags, min=1e-8))
+        lower = P[:, self.tril_idx[0], self.tril_idx[1]]
+        return torch.cat([log_diags, lower], dim=1)
 
     def forward(self, P_old):
         B = P_old.shape[0]
         
-        # 1. Physics Propagation: P_phys = F * P_old * F^T
-        P_phys = self.F_norm @ P_old @ self.F_norm.T
+        P_anchor = self.F_anchor @ P_old @ self.F_anchor.T
         
-        # 2. Learned Process Noise: Q = Net(P_old)
-        # We flatten P_old to feed the net
-        features = P_old.view(B, -1)
+        features = self.extract_features(P_old)
         out = self.net(features)
         
-        # Construct Q via Cholesky L_Q
         raw_diag = out[:, :self.n_diag]
-        diag_vals = F.softplus(raw_diag) + 1e-6
+        diag_vals = F.softplus(raw_diag) + 1e-8
         lower_vals = out[:, self.n_diag:]
         
-        L_Q = torch.zeros(B, self.nx, self.nx, device=P_old.device)
-        L_Q.as_strided((B, self.nx), (self.nx*self.nx, self.nx + 1)).copy_(diag_vals)
-        L_Q[:, self.tril_idx[0], self.tril_idx[1]] = lower_vals
+        L = torch.zeros(B, self.nx, self.nx, device=P_old.device)
+        L.as_strided((B, self.nx), (self.nx*self.nx, self.nx + 1)).copy_(diag_vals)
+        L[:, self.tril_idx[0], self.tril_idx[1]] = lower_vals
         
-        Q = L_Q @ L_Q.transpose(1, 2)
+        Q = L @ L.transpose(1, 2)
         
-        # 3. Combine: P_new = P_phys + Q
-        return P_phys + Q
+        return P_anchor + Q
 
 # =============================================================================
 # UKF CORE
@@ -162,11 +162,9 @@ class UKFCore:
         self.Wm, self.Wc = Wm, Wc
 
     def _safe_cholesky(self, P):
-        # Robust Cholesky with fallback
-        P_reg = P + 1e-5 * torch.eye(self.nx, device=self.device)
-        try: return torch.linalg.cholesky(P_reg)
+        try: return torch.linalg.cholesky(P + 1e-5 * torch.eye(self.nx, device=self.device))
         except:
-            v, e = torch.linalg.eigh(P_reg)
+            v, e = torch.linalg.eigh(P + 1e-5 * torch.eye(self.nx, device=self.device))
             v = torch.clamp(v, min=1e-5)
             return e @ torch.diag_embed(torch.sqrt(v))
 
@@ -183,18 +181,13 @@ class UKFCore:
         z_diff = z_sigma - z_hat.unsqueeze(1)
         x_diff = sigma - x_pred.unsqueeze(1)
         
-        # Manual broadcasting for stability
         S = self.R.clone()
         C = torch.zeros(x_pred.shape[0], self.nx, self.nz, device=self.device)
         
         for i in range(self.n_sigma):
-            wd = self.Wc[i].view(1, 1, 1) # Explicit broadcast shape
-            
-            z_outer = z_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2)
-            S = S + wd * z_outer
-            
-            xz_outer = x_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2)
-            C = C + wd * xz_outer
+            wd = self.Wc[i].view(1, 1, 1)
+            S = S + wd * (z_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2))
+            C = C + wd * (x_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2))
             
         try: K = torch.linalg.solve(S, C.transpose(1, 2)).transpose(1, 2)
         except: K = C @ torch.linalg.pinv(S)
@@ -202,13 +195,10 @@ class UKFCore:
         y = z - z_hat
         x_new = x_pred + (K @ y.unsqueeze(-1)).squeeze(-1)
         P_new = P_pred - K @ S @ K.transpose(-1, -2)
-        
-        # Symmetrize P to prevent drift
-        P_new = 0.5 * (P_new + P_new.transpose(1, 2))
         return x_new, P_new, y, S
 
 # =============================================================================
-# WRAPPER
+# WRAPPER (Restored)
 # =============================================================================
 class NeuralKFv10:
     def __init__(self, mean_net, cov_net, scaler, R, device):
@@ -233,13 +223,10 @@ class NeuralKFv10:
             for t in range(T):
                 x_norm = self.scaler.normalize(x)
                 P_norm = self.scaler.scale_cov(P)
-                
                 x_pred_norm = self.mean_net(x_norm)
                 P_pred_norm = self.cov_net(P_norm)
-                
                 x_pred = self.scaler.denormalize(x_pred_norm)
                 P_pred = self.scaler.unscale_cov(P_pred_norm)
-                
                 x, P, _, _ = self.ukf.update(x_pred, P_pred, z_seq[:, t], h_fn)
                 states.append(x.cpu().numpy())
                 covs.append(P.cpu().numpy())
@@ -248,41 +235,43 @@ class NeuralKFv10:
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
-def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu', **kwargs):
+def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=400, lr=1e-3, device='cpu', **kwargs):
     device = torch.device(device)
     z_train = torch.as_tensor(z_train, dtype=torch.float32, device=device)
     
-    # Config
-    pos_scale, vel_scale = 100.0, 10.0
-    dt_norm = 0.5 * vel_scale / pos_scale
+    scaler = StateScaler(100.0, 10.0, device)
     
-    # Models
-    mean_net = PhysicsGuidedMeanNet(nx, dt_norm=dt_norm).to(device)
-    cov_net = PhysicsAnchoredCovNet(nx, dt_norm=dt_norm).to(device)
-    scaler = StateScaler(pos_scale, vel_scale, device)
+    mean_net = MeanNet(nx).to(device)
+    cov_net = CovNetFromP(nx).to(device)
     ukf = UKFCore(nx, nz, R, device)
     
-    # Optimizer with Gradient Clipping Hooks
-    optimizer = optim.Adam([
-        {'params': mean_net.parameters(), 'lr': 1e-4}, 
-        {'params': cov_net.parameters(), 'lr': 1e-3}
-    ])
+    # Optimizer: Uniform 1e-3
+    opt_linear = optim.Adam(mean_net.linear.parameters(), lr=1e-3)
+    opt_mlp    = optim.Adam(mean_net.mlp.parameters(), lr=1e-3)
+    opt_cov    = optim.Adam(cov_net.parameters(), lr=1e-3)
     
-    print(f"[Train] v12 Physics Anchored | Stable C_theta(P)")
+    print(f"[Train] v19 Stabilized Descent | Medium Stiffness")
     
     history = {'loss': [], 'best_epoch': 0}
     best_loss = float('inf')
     
+    PHASE_2 = 100 # Unfreeze MLP
+    PHASE_3 = 200 # Unfreeze Cov
+    
     for ep in range(epochs):
-        # STAGED TRAINING
-        if ep < 50:
-            mean_net.eval() # Freeze Physics first
-            cov_net.train()
-        else:
-            mean_net.train() # Learn Physics later
-            cov_net.train()
+        train_linear = True
+        train_mlp    = (ep >= PHASE_2)
+        train_cov    = (ep >= PHASE_3)
+        
+        if ep == PHASE_2: print(">>> Phase 2: Unfreezing MLP <<<")
+        if ep == PHASE_3: print(">>> Phase 3: Unfreezing Covariance <<<")
             
-        optimizer.zero_grad()
+        mean_net.train()
+        cov_net.train() if train_cov else cov_net.eval()
+        
+        opt_linear.zero_grad()
+        if train_mlp: opt_mlp.zero_grad()
+        if train_cov: opt_cov.zero_grad()
         
         B = z_train.shape[0]
         x = torch.as_tensor(x0, device=device).unsqueeze(0).expand(B, -1)
@@ -293,33 +282,26 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu
         tbptt_len = 10
         
         for t in range(z_train.shape[1]):
-            # Norm
             x_norm = scaler.normalize(x)
             P_norm = scaler.scale_cov(P)
             
-            # Predict
             x_pred_norm = mean_net(x_norm)
             P_pred_norm = cov_net(P_norm)
             
-            # Denorm
             x_pred = scaler.denormalize(x_pred_norm)
             P_pred = scaler.unscale_cov(P_pred_norm)
             
-            # Update
             x, P, y, S = ukf.update(x_pred, P_pred, z_train[:, t], h_fn)
             
-            # Robust NLL Loss
             try:
                 L_S = torch.linalg.cholesky(S)
                 log_det = 2 * torch.sum(torch.log(torch.diagonal(L_S, dim1=-2, dim2=-1)), dim=-1)
                 sol = torch.linalg.solve(L_S, y.unsqueeze(-1)).squeeze(-1)
                 mahal = torch.sum(sol**2, dim=-1)
             except:
-                # Fallback for singularity
                 mahal = torch.sum(y**2, dim=-1)
-                log_det = torch.zeros_like(mahal) + 5.0 
+                log_det = torch.zeros_like(mahal) + 5.0
                 
-            # Soft clamp loss to prevent single-batch explosion
             loss_t = torch.mean(log_det + mahal)
             loss_chunk += loss_t
             
@@ -327,12 +309,20 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=200, lr=1e-3, device='cpu
                 avg_loss = loss_chunk / tbptt_len
                 avg_loss.backward()
                 
-                # STRICT CLIPPING
-                torch.nn.utils.clip_grad_norm_(mean_net.parameters(), 0.5)
-                torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 1.0)
+                # Strict Clipping (0.5) to prevent jumping
+                torch.nn.utils.clip_grad_norm_(mean_net.linear.parameters(), 0.5)
+                opt_linear.step()
+                opt_linear.zero_grad()
                 
-                optimizer.step()
-                optimizer.zero_grad()
+                if train_mlp:
+                    torch.nn.utils.clip_grad_norm_(mean_net.mlp.parameters(), 0.5)
+                    opt_mlp.step()
+                    opt_mlp.zero_grad()
+                
+                if train_cov:
+                    torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 0.5)
+                    opt_cov.step()
+                    opt_cov.zero_grad()
                 
                 x = x.detach(); P = P.detach()
                 total_loss += avg_loss.item()

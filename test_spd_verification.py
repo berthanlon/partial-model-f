@@ -25,7 +25,7 @@ R_true = np.eye(nz, dtype=np.float32) * sigma_r**2
 x0_mean = np.array([100.0, 1.0, 50.0, 0.5], dtype=np.float32)
 P0 = np.diag([10.0, 1.0, 10.0, 1.0]).astype(np.float32)
 
-n_train, n_test, n_timesteps = 2000, 100, 100
+n_train, n_test, n_timesteps = 2000, 100, 50
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
