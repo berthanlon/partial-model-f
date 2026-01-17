@@ -1,17 +1,22 @@
-# test_spd_verification.py
-"""Test v10 - Residual architecture."""
+"""
+Test script for Neural KF v23 - Simple Baseline with Diagnostics
+
+Key question: Can the network learn velocity dynamics from range measurements alone?
+"""
 import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from nn_train import train_v10, NeuralKFv10
+from nn_train import train_v23, NeuralKFv23, SimpleDynamicsNet, FixedCovPredictor, StateScaler, UKFCore, analyze_gradients
 
 torch.set_default_dtype(torch.float32)
 np.random.seed(42)
 torch.manual_seed(42)
 
-# Config
+# =============================================================================
+# CONFIG
+# =============================================================================
 nx, nz = 4, 2
 dt = 0.5
 RADAR_BASELINE = 150.0
@@ -53,36 +58,6 @@ def generate_data(n_seq, T):
             x = F_true @ x + L_Q @ np.random.randn(nx).astype(np.float32)
     return states, measurements
 
-print("Generating data...")
-gt_train, z_train = generate_data(n_train, n_timesteps)
-gt_test, z_test = generate_data(n_test, n_timesteps)
-print(f"Train: {z_train.shape}, Test: {z_test.shape}")
-
-output_dir = "./test_output_v10"
-os.makedirs(output_dir, exist_ok=True)
-
-print("\n" + "="*60)
-print("TRAINING v10 - RESIDUAL ARCHITECTURE")
-print("="*60)
-
-mean_net, cov_net, scaler, history = train_v10(
-    z_train=z_train, R=R_true, h_fn=h_torch,
-    x0=x0_mean, P0=P0, nx=nx, nz=nz,
-    dt=dt, pos_scale=100.0, vel_scale=5.0,
-    epochs=400, lr=1e-3, device=str(device),
-    checkpoint_path=os.path.join(output_dir, 'neural_kf_v10.pth'),
-    tbptt_len=5, verbose=True
-)
-
-plt.figure(figsize=(10, 4))
-plt.plot(history['loss'])
-plt.xlabel('Epoch'); plt.ylabel('Loss (NLL)')
-plt.title(f"Training Loss (best @ epoch {history['best_epoch']})")
-plt.grid(True)
-plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=150)
-plt.close()
-
-# UKF Baseline with robust covariance handling
 class UKFBaseline:
     def __init__(self, F, Q, R, h_fn, alpha=0.001, beta=2.0, kappa=0.0):
         self.F, self.Q, self.R, self.h = F, Q, R, h_fn
@@ -98,10 +73,9 @@ class UKFBaseline:
         self.n_sigma = n
     
     def _ensure_spd(self, P):
-        """Ensure matrix is symmetric positive definite."""
-        P = 0.5 * (P + P.T)  # Symmetrize
+        P = 0.5 * (P + P.T)
         eigvals, eigvecs = np.linalg.eigh(P)
-        eigvals = np.maximum(eigvals, 1e-6)  # Clamp eigenvalues
+        eigvals = np.maximum(eigvals, 1e-6)
         return eigvecs @ np.diag(eigvals) @ eigvecs.T
     
     def run(self, z_seq, x0, P0):
@@ -112,13 +86,11 @@ class UKFBaseline:
             x_pred = self.F @ x
             P_pred = self.F @ P @ self.F.T + self.Q
             P_pred = self._ensure_spd(P_pred)
-            
             try:
                 L = np.linalg.cholesky(P_pred + 1e-6 * np.eye(self.nx))
             except:
                 P_pred = self._ensure_spd(P_pred + 1e-4 * np.eye(self.nx))
                 L = np.linalg.cholesky(P_pred)
-            
             sigma = np.zeros((self.n_sigma, self.nx))
             sigma[0] = x_pred
             for i in range(self.nx):
@@ -134,176 +106,260 @@ class UKFBaseline:
             K = C @ np.linalg.inv(S)
             x = x_pred + K @ (z_seq[t] - z_hat)
             P = P_pred - K @ S @ K.T
-            P = self._ensure_spd(P)  # Ensure SPD after update
+            P = self._ensure_spd(P)
             xs[t], Ps[t] = x, P
         return xs, Ps
 
+# =============================================================================
+# GRADIENT ANALYSIS (Before training)
+# =============================================================================
+print("\n" + "="*60)
+print("GRADIENT ANALYSIS - Understanding what's learnable")
+print("="*60)
+
+gt_train, z_train = generate_data(n_train, n_timesteps)
+gt_test, z_test = generate_data(n_test, n_timesteps)
+
+z_train_t = torch.as_tensor(z_train, dtype=torch.float32, device=device)
+
+# Initialize fresh networks
+scaler = StateScaler(100.0, 1.0, device)
+mean_net = SimpleDynamicsNet(nx).to(device)
+cov_net = FixedCovPredictor(nx).to(device)
+ukf = UKFCore(nx, nz, R_true, device)
+
+# Analyze gradients
+grads = analyze_gradients(mean_net, cov_net, scaler, ukf, z_train_t[:100], x0_mean, P0, h_torch, device)
+
+print("\nGradient magnitudes (larger = more learnable):")
+for k, v in grads.items():
+    print(f"  {k}: {v:.6f}")
+
+print("\nInterpretation:")
+print("  - If d_NLL is much smaller than d_pred_x/y, velocity has weak gradient signal")
+print("  - The network may not be able to learn velocity dynamics from NLL alone")
+
+# =============================================================================
+# MAIN TRAINING
+# =============================================================================
+output_dir = "./test_output_v23"
+os.makedirs(output_dir, exist_ok=True)
+
+print("\n" + "="*60)
+print("TRAINING v23 - SIMPLE BASELINE")
+print("="*60)
+
+mean_net, cov_net, scaler, history = train_v23(
+    z_train=z_train, R=R_true, h_fn=h_torch,
+    x0=x0_mean, P0=P0, nx=nx, nz=nz,
+    pos_scale=100.0, vel_scale=1.0,
+    epochs=400, lr=1e-3, device=str(device),
+    checkpoint_path=os.path.join(output_dir, 'neural_kf_v23.pth'),
+    verbose=True
+)
+
+# Plot training
+plt.figure(figsize=(10, 5))
+plt.plot(history['loss'])
+plt.xlabel('Epoch')
+plt.ylabel('Loss (NLL)')
+plt.title(f"Training Loss (best @ epoch {history['best_epoch']})")
+plt.axvline(200, color='r', ls='--', label='Phase 2 (unfreeze cov)')
+plt.legend()
+plt.grid(True)
+plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=150)
+plt.close()
+
+# =============================================================================
+# TESTING
+# =============================================================================
 print("\n" + "="*60)
 print("TESTING")
 print("="*60)
 
-neural_kf = NeuralKFv10(mean_net, cov_net, scaler, R_true, device)
-ukf = UKFBaseline(F_true, Q_true, R_true, h_numpy)
+neural_kf = NeuralKFv23(mean_net, cov_net, scaler, R_true, device)
+ukf_baseline = UKFBaseline(F_true, Q_true, R_true, h_numpy)
 
-test_idx = 0
-neural_states, _ = neural_kf.run(z_test[test_idx], x0_mean, P0, h_torch)
-neural_states = neural_states[0]
-ukf_states, _ = ukf.run(z_test[test_idx], x0_mean, P0)
-gt = gt_test[test_idx]
+n_eval = 50
+neural_rmse_all, ukf_rmse_all = [], []
+neural_states_all, ukf_states_all, gt_all = [], [], []
+neural_covs_all, ukf_covs_all = [], []
 
-rmse_neural = np.sqrt(np.mean((neural_states[:, [0,2]] - gt[:, [0,2]])**2, axis=1))
-rmse_ukf = np.sqrt(np.mean((ukf_states[:, [0,2]] - gt[:, [0,2]])**2, axis=1))
+for seq_idx in range(n_eval):
+    n_states, n_covs = neural_kf.run(z_test[seq_idx], x0_mean, P0, h_torch)
+    u_states, u_covs = ukf_baseline.run(z_test[seq_idx], x0_mean, P0)
+    g = gt_test[seq_idx]
+    
+    neural_states_all.append(n_states[0])
+    ukf_states_all.append(u_states)
+    gt_all.append(g)
+    neural_covs_all.append(n_covs[0])
+    ukf_covs_all.append(u_covs)
+    
+    n_rmse = np.sqrt(np.mean((n_states[0][:, [0,2]] - g[:, [0,2]])**2, axis=1))
+    u_rmse = np.sqrt(np.mean((u_states[:, [0,2]] - g[:, [0,2]])**2, axis=1))
+    
+    neural_rmse_all.append(np.mean(n_rmse))
+    ukf_rmse_all.append(np.mean(u_rmse))
 
-print(f"Single sequence RMSE:")
-print(f"  Neural KF v10: mean={rmse_neural.mean():.3f}")
-print(f"  UKF:           mean={rmse_ukf.mean():.3f}")
+neural_states_all = np.array(neural_states_all)
+ukf_states_all = np.array(ukf_states_all)
+gt_all = np.array(gt_all)
+neural_covs_all = np.array(neural_covs_all)
+ukf_covs_all = np.array(ukf_covs_all)
 
-# Plots
+print(f"Average Position RMSE over {n_eval} sequences:")
+print(f"  Neural KF v23: {np.mean(neural_rmse_all):.3f} +/- {np.std(neural_rmse_all):.3f}")
+print(f"  UKF (oracle):  {np.mean(ukf_rmse_all):.3f} +/- {np.std(ukf_rmse_all):.3f}")
+
+neural_vel_rmse = np.sqrt(np.mean((neural_states_all[:, :, [1,3]] - gt_all[:, :, [1,3]])**2))
+ukf_vel_rmse = np.sqrt(np.mean((ukf_states_all[:, :, [1,3]] - gt_all[:, :, [1,3]])**2))
+print(f"\nAverage Velocity RMSE:")
+print(f"  Neural KF v23: {neural_vel_rmse:.3f}")
+print(f"  UKF (oracle):  {ukf_vel_rmse:.3f}")
+
+# NEES
+neural_nees_all = []
+ukf_nees_all = []
+for seq_idx in range(n_eval):
+    for t in range(n_timesteps):
+        err_n = neural_states_all[seq_idx, t] - gt_all[seq_idx, t]
+        err_u = ukf_states_all[seq_idx, t] - gt_all[seq_idx, t]
+        P_n = neural_covs_all[seq_idx, t]
+        P_u = ukf_covs_all[seq_idx, t]
+        try:
+            neural_nees_all.append(err_n @ np.linalg.inv(P_n + 1e-6*np.eye(nx)) @ err_n)
+            ukf_nees_all.append(err_u @ np.linalg.inv(P_u + 1e-6*np.eye(nx)) @ err_u)
+        except:
+            pass
+
+print(f"\nNEES (should be ~{nx}):")
+print(f"  Neural KF v23: {np.mean(neural_nees_all):.2f}")
+print(f"  UKF (oracle):  {np.mean(ukf_nees_all):.2f}")
+
+# =============================================================================
+# DYNAMICS ANALYSIS
+# =============================================================================
+print("\n" + "="*60)
+print("LEARNED DYNAMICS ANALYSIS")
+print("="*60)
+
+mean_net.eval()
+with torch.no_grad():
+    # Test various states
+    test_states_norm = torch.tensor([
+        [1.0, 0.00, 0.5, 0.00],   # stationary
+        [1.0, 0.01, 0.5, 0.005],  # vx=1, vy=0.5
+        [1.0, 0.02, 0.5, 0.01],   # vx=2, vy=1
+        [1.0, -0.01, 0.5, -0.005],# backward
+    ], device=device, dtype=torch.float32)
+    
+    deltas = mean_net.get_delta(test_states_norm).cpu().numpy()
+    
+    print("\nLearned deltas (normalized space):")
+    print("-" * 60)
+    labels = ['stationary', 'vx=1,vy=0.5', 'vx=2,vy=1', 'backward']
+    for i, lbl in enumerate(labels):
+        d = deltas[i]
+        # Expected for CV: dx = vx * dt / pos_scale = vx_norm * vel_scale * dt / pos_scale
+        # With vel_scale=1, pos_scale=100, dt=0.5: dx = vx_norm * 0.005
+        vx_norm = test_states_norm[i, 1].item()
+        expected_dx = vx_norm * 0.005
+        print(f"  {lbl:15s}: Δx={d[0]:.5f} (expect {expected_dx:.5f}), Δvx={d[1]:.5f}")
+
+    # Sweep vx to see if delta depends on it
+    vx_range = np.linspace(-0.02, 0.02, 21)
+    dx_values = []
+    for vx in vx_range:
+        x_test = torch.tensor([[1.0, vx, 0.5, 0.0]], device=device, dtype=torch.float32)
+        delta = mean_net.get_delta(x_test)[0, 0].cpu().item()
+        dx_values.append(delta)
+    
+    corr = np.corrcoef(vx_range, dx_values)[0, 1]
+    slope, intercept = np.polyfit(vx_range, dx_values, 1)
+    
+    print(f"\nΔx vs vx analysis:")
+    print(f"  Correlation: {corr:.3f} (should be ~1.0 for CV)")
+    print(f"  Slope: {slope:.5f} (should be ~0.005 for CV)")
+    print(f"  Intercept: {intercept:.5f} (should be ~0)")
+
+# =============================================================================
+# PLOTS
+# =============================================================================
 t_plot = np.arange(n_timesteps)
+
+# State comparison
+test_idx = 0
+gt = gt_all[test_idx]
+neural_states = neural_states_all[test_idx]
+ukf_states = ukf_states_all[test_idx]
+
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 labels = ['x (m)', 'vx (m/s)', 'y (m)', 'vy (m/s)']
 for i, (ax, lbl) in enumerate(zip(axes.flat, labels)):
     ax.plot(t_plot, gt[:, i], 'k-', lw=2, label='Ground Truth')
-    ax.plot(t_plot, neural_states[:, i], 'b-', alpha=0.8, label='Neural KF v10')
-    ax.plot(t_plot, ukf_states[:, i], 'r--', alpha=0.8, label='UKF')
-    ax.set_xlabel('Time Step'); ax.set_ylabel(lbl)
-    ax.legend(); ax.grid(True)
+    ax.plot(t_plot, neural_states[:, i], 'b-', alpha=0.8, label='Neural KF v23')
+    ax.plot(t_plot, ukf_states[:, i], 'r--', alpha=0.8, label='UKF (oracle)')
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel(lbl)
+    ax.legend()
+    ax.grid(True)
+plt.suptitle('State Estimation', fontsize=14)
 plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'state_comparison.png'), dpi=150)
 plt.close()
 
-plt.figure(figsize=(8, 8))
-plt.plot(gt[:, 0], gt[:, 2], 'k-', lw=2, label='Ground Truth')
-plt.plot(neural_states[:, 0], neural_states[:, 2], 'b-', alpha=0.8, label='Neural KF v10')
-plt.plot(ukf_states[:, 0], ukf_states[:, 2], 'r--', alpha=0.8, label='UKF')
-plt.plot(0, 0, 'g^', ms=10); plt.plot(RADAR_BASELINE, 0, 'm^', ms=10)
-plt.xlabel('X (m)'); plt.ylabel('Y (m)')
-plt.legend(); plt.grid(True); plt.axis('equal')
-plt.savefig(os.path.join(output_dir, 'xy_trajectory.png'), dpi=150)
-plt.close()
-
-plt.figure(figsize=(10, 5))
-plt.plot(t_plot, rmse_neural, 'b-', lw=2, label='Neural KF v10')
-plt.plot(t_plot, rmse_ukf, 'r--', lw=2, label='UKF')
-plt.xlabel('Time Step'); plt.ylabel('Position RMSE (m)')
-plt.legend(); plt.grid(True)
-plt.savefig(os.path.join(output_dir, 'rmse_comparison.png'), dpi=150)
-plt.close()
-
-# Multi-sequence
-print("\n" + "="*60)
-print("MULTI-SEQUENCE EVALUATION")
-print("="*60)
-
-neural_rmse_all, ukf_rmse_all = [], []
-neural_rmse_per_t = np.zeros((50, n_timesteps))
-ukf_rmse_per_t = np.zeros((50, n_timesteps))
-
-for seq_idx in range(50):
-    n_states, _ = neural_kf.run(z_test[seq_idx], x0_mean, P0, h_torch)
-    n_states = n_states[0]
-    u_states, _ = ukf.run(z_test[seq_idx], x0_mean, P0)
-    g = gt_test[seq_idx]
-    
-    # Per-timestep RMSE for this sequence
-    neural_rmse_t = np.sqrt(np.mean((n_states[:, [0,2]] - g[:, [0,2]])**2, axis=1))
-    ukf_rmse_t = np.sqrt(np.mean((u_states[:, [0,2]] - g[:, [0,2]])**2, axis=1))
-    
-    neural_rmse_per_t[seq_idx] = neural_rmse_t
-    ukf_rmse_per_t[seq_idx] = ukf_rmse_t
-    
-    neural_rmse_all.append(np.mean(neural_rmse_t))
-    ukf_rmse_all.append(np.mean(ukf_rmse_t))
-
-print(f"Average RMSE over 50 sequences:")
-print(f"  Neural KF v10: {np.mean(neural_rmse_all):.3f} +/- {np.std(neural_rmse_all):.3f}")
-print(f"  UKF:           {np.mean(ukf_rmse_all):.3f} +/- {np.std(ukf_rmse_all):.3f}")
-
-# Box plot
-plt.figure(figsize=(8, 6))
-plt.boxplot([neural_rmse_all, ukf_rmse_all], labels=['Neural KF v10', 'UKF'])
-plt.ylabel('Position RMSE (m)')
-plt.grid(True, axis='y')
-plt.savefig(os.path.join(output_dir, 'rmse_boxplot.png'), dpi=150)
-plt.close()
-
-# RMSE vs Time across all sequences
-plt.figure(figsize=(12, 5))
-
-neural_mean = np.mean(neural_rmse_per_t, axis=0)
-neural_std = np.std(neural_rmse_per_t, axis=0)
-ukf_mean = np.mean(ukf_rmse_per_t, axis=0)
-ukf_std = np.std(ukf_rmse_per_t, axis=0)
-
-plt.subplot(1, 2, 1)
-plt.plot(t_plot, neural_mean, 'b-', lw=2, label='Neural KF v10')
-plt.fill_between(t_plot, neural_mean - neural_std, neural_mean + neural_std, alpha=0.3, color='blue')
-plt.plot(t_plot, ukf_mean, 'r--', lw=2, label='UKF')
-plt.fill_between(t_plot, ukf_mean - ukf_std, ukf_mean + ukf_std, alpha=0.3, color='red')
-plt.xlabel('Time Step')
-plt.ylabel('Position RMSE (m)')
-plt.title('Mean RMSE +/- Std over 50 Sequences')
-plt.legend()
-plt.grid(True)
-
-plt.subplot(1, 2, 2)
-neural_median = np.median(neural_rmse_per_t, axis=0)
-neural_p25 = np.percentile(neural_rmse_per_t, 25, axis=0)
-neural_p75 = np.percentile(neural_rmse_per_t, 75, axis=0)
-ukf_median = np.median(ukf_rmse_per_t, axis=0)
-ukf_p25 = np.percentile(ukf_rmse_per_t, 25, axis=0)
-ukf_p75 = np.percentile(ukf_rmse_per_t, 75, axis=0)
-
-plt.plot(t_plot, neural_median, 'b-', lw=2, label='Neural KF v10')
-plt.fill_between(t_plot, neural_p25, neural_p75, alpha=0.3, color='blue')
-plt.plot(t_plot, ukf_median, 'r--', lw=2, label='UKF')
-plt.fill_between(t_plot, ukf_p25, ukf_p75, alpha=0.3, color='red')
-plt.xlabel('Time Step')
-plt.ylabel('Position RMSE (m)')
-plt.title('Median RMSE (25-75 percentile) over 50 Sequences')
-plt.legend()
-plt.grid(True)
-
+# Δx vs vx plot
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.plot(vx_range, dx_values, 'b.-', lw=2, ms=8, label='Learned')
+ax.plot(vx_range, vx_range * 0.005, 'r--', lw=2, label='Expected (CV)')
+ax.set_xlabel('vx (normalized)')
+ax.set_ylabel('Δx (normalized)')
+ax.set_title(f'Does Δx depend on vx?\nCorrelation: {corr:.3f}, Slope: {slope:.5f}')
+ax.legend()
+ax.grid(True)
 plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'rmse_vs_time_all_sequences.png'), dpi=150)
+plt.savefig(os.path.join(output_dir, 'delta_vs_velocity.png'), dpi=150)
 plt.close()
 
-print(f"\nPer-timestep stats (t=0, t=10, t=49):")
-for t_idx in [0, 10, 49]:
-    print(f"  t={t_idx}: Neural={neural_mean[t_idx]:.2f}+/-{neural_std[t_idx]:.2f}, UKF={ukf_mean[t_idx]:.2f}+/-{ukf_std[t_idx]:.2f}")
+# Variance comparison
+neural_vars = np.diagonal(neural_covs_all, axis1=2, axis2=3)
+ukf_vars = np.diagonal(ukf_covs_all, axis1=2, axis2=3)
+neural_vars_mean = np.mean(neural_vars, axis=0)
+ukf_vars_mean = np.mean(ukf_vars, axis=0)
 
-# Dynamics analysis
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+state_labels = ['σ_x', 'σ_vx', 'σ_y', 'σ_vy']
+for i, (ax, lbl) in enumerate(zip(axes.flat, state_labels)):
+    ax.semilogy(t_plot, neural_vars_mean[:, i], 'b-', lw=2, label='Neural KF v23')
+    ax.semilogy(t_plot, ukf_vars_mean[:, i], 'r--', lw=2, label='UKF (oracle)')
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Variance')
+    ax.set_title(f'{lbl} Variance')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'variance_comparison.png'), dpi=150)
+plt.close()
+
+print(f"\nAll plots saved to: {output_dir}")
+
+# =============================================================================
+# FINAL DIAGNOSIS
+# =============================================================================
 print("\n" + "="*60)
-print("LEARNED DYNAMICS")
+print("DIAGNOSIS")
 print("="*60)
 
-mean_net.eval()
-
-with torch.no_grad():
-    # Test in PHYSICAL space (not normalized) since our dynamics work in physical space
-    test_phys = torch.tensor([
-        [100.0, 1.0, 50.0, 0.5],    # typical state
-        [100.0, 2.0, 50.0, 1.0],    # faster
-        [100.0, 0.0, 50.0, 0.0],    # stationary
-        [100.0, -1.0, 50.0, -0.5],  # moving backward
-    ], device=device, dtype=torch.float32)
-    
-    pred_phys = mean_net(test_phys)
-    
-    print(f"\nIn PHYSICAL space (dt={dt}):")
-    print("-" * 70)
-    
-    for i in range(len(test_phys)):
-        inp = test_phys[i].cpu().numpy()
-        out = pred_phys[i].cpu().numpy()
-        delta = out - inp
-        
-        expected_delta_x = inp[1] * dt  # vx * dt
-        expected_delta_y = inp[3] * dt  # vy * dt
-        
-        print(f"Input: x={inp[0]:.1f}, vx={inp[1]:.2f}, y={inp[2]:.1f}, vy={inp[3]:.2f}")
-        print(f"  Learned delta:  dx={delta[0]:.4f}, dvx={delta[1]:.6f}, dy={delta[2]:.4f}, dvy={delta[3]:.6f}")
-        print(f"  Expected delta: dx={expected_delta_x:.4f}, dvx=0.0000, dy={expected_delta_y:.4f}, dvy=0.0000")
-        print()
-
-print(f"Saved to: {output_dir}")
+if abs(corr) < 0.5:
+    print("❌ The network did NOT learn that Δx depends on vx")
+    print("   This confirms that NLL loss alone cannot teach velocity dynamics")
+    print("   from range measurements - the gradient signal is too weak.")
+    print("\n   POSSIBLE SOLUTIONS:")
+    print("   1. Use supervised pre-training with known F")
+    print("   2. Add auxiliary loss that directly rewards velocity prediction")
+    print("   3. Use different measurement model with better velocity observability")
+    print("   4. Accept that this is a fundamental limitation of the approach")
+else:
+    print("✓ The network learned some velocity dependence!")
+    print(f"  Correlation: {corr:.3f}, Slope: {slope:.5f} (expected 0.005)")

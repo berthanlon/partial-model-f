@@ -1,17 +1,34 @@
 """
-Neural Kalman Filter v19.1 - STABILIZED DESCENT & COMPLETE
+Neural Kalman Filter v23 - Simpler Architecture + Diagnostics
 
-1. Initialization:
-   - MeanNet: Exact Zero (Start as Identity).
-   - CovNet: Medium Stiffness (Softplus(-4.0) -> ~2m uncertainty).
-     *Prevents the "Valley of Death" gradient explosion.*
+DIAGNOSIS OF v22 FAILURE:
+========================
+The training loss went UP, meaning the network couldn't even fit the training data.
+The multi-step and consistency losses added instability without helping.
 
-2. Optimization:
-   - LR: 1e-3 (Prevent overshoot).
-   - Clip: 0.5 (Prevent jumps).
-   
-3. Curriculum:
-   - 100 Epochs Linear Only -> Then MLP -> Then Covariance.
+ROOT CAUSE ANALYSIS:
+===================
+1. The measurement model (range from 2 radars) weakly observes velocity
+2. Gradient signal for learning velocity dynamics is very weak
+3. Complex losses (multi-step, consistency) added noise without signal
+
+NEW APPROACH:
+============
+1. Much simpler architecture - just learn the dynamics
+2. Careful initialization 
+3. Freeze covariance initially, focus on mean prediction
+4. Add diagnostic tools to understand what's happening
+
+KEY INSIGHT: Maybe the problem isn't the architecture but the LOSS.
+The NLL loss for Kalman filtering is:
+    L = log|S| + y^T S^{-1} y
+where S = H P H^T + R and y = z - h(x_pred)
+
+This loss doesn't directly reward good STATE predictions - it rewards good 
+MEASUREMENT predictions. If the measurement model doesn't distinguish between
+different velocities well, the network has no gradient signal to learn velocity.
+
+Let's verify this hypothesis and try a simpler baseline first.
 """
 import os
 import numpy as np
@@ -20,38 +37,41 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-# =============================================================================
-# SCALER
-# =============================================================================
+
 class StateScaler:
-    def __init__(self, pos_scale=100.0, vel_scale=10.0, device='cpu'):
+    def __init__(self, pos_scale=100.0, vel_scale=1.0, device='cpu'):
         self.device = device
         self.scale = torch.tensor([pos_scale, vel_scale, pos_scale, vel_scale], 
                                    dtype=torch.float32, device=device)
         self.inv_scale = 1.0 / self.scale
         
-    def normalize(self, x_phys): return x_phys * self.inv_scale
-    def denormalize(self, x_norm): return x_norm * self.scale
+    def normalize(self, x_phys): 
+        return x_phys * self.inv_scale
+    
+    def denormalize(self, x_norm): 
+        return x_norm * self.scale
+    
     def scale_cov(self, P):
-        D_inv = torch.diag(self.inv_scale)
-        return D_inv @ P @ D_inv
+        D_inv = self.inv_scale.view(-1, 1) * self.inv_scale.view(1, -1)
+        return P * D_inv
+    
     def unscale_cov(self, P_norm):
-        D = torch.diag(self.scale)
-        return D @ P_norm @ D
+        D = self.scale.view(-1, 1) * self.scale.view(1, -1)
+        return P_norm * D
 
-# =============================================================================
-# 1. MEAN NET (Linear Shortcut)
-# =============================================================================
-class MeanNet(nn.Module):
+
+class SimpleDynamicsNet(nn.Module):
+    """
+    Simplest possible dynamics: x' = x + f(x)
+    where f is a small MLP.
+    
+    No bells and whistles - just learn the residual.
+    """
     def __init__(self, nx, hidden=64):
         super().__init__()
         self.nx = nx
         
-        # A. Fast Lane (Linear Physics)
-        self.linear = nn.Linear(nx, nx, bias=False)
-        
-        # B. Slow Lane (Non-linear Residuals)
-        self.mlp = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(nx, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
@@ -59,97 +79,61 @@ class MeanNet(nn.Module):
             nn.Linear(hidden, nx)
         )
         
-        # --- INITIALIZATION ---
-        # 1. Init Linear to EXACT ZERO.
-        #    Reason: Even small noise * 100.0 scale = huge physical error.
-        #    We rely on the gradient from the loss to push it from zero.
-        self.linear.weight.data.zero_()
-        
-        # 2. Init MLP to Zero
-        for m in self.mlp:
+        # Initialize to output near-zero
+        for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=0.01)
+                nn.init.xavier_normal_(m.weight, gain=0.1)
                 nn.init.zeros_(m.bias)
-        with torch.no_grad():
-            self.mlp[-1].weight.zero_()
-            self.mlp[-1].bias.zero_()
+        self.net[-1].weight.data.mul_(0.01)
+        self.net[-1].bias.data.zero_()
 
     def forward(self, x):
-        return x + self.linear(x) + self.mlp(x)
+        return x + self.net(x)
+    
+    def get_delta(self, x):
+        return self.net(x)
 
-# =============================================================================
-# 2. COVARIANCE NET (Goldilocks Init)
-# =============================================================================
-class CovNetFromP(nn.Module):
-    def __init__(self, nx, hidden=128):
+
+class FixedCovPredictor(nn.Module):
+    """
+    Fixed covariance prediction: P' = P + Q
+    where Q is a learned constant SPD matrix.
+    
+    No state-dependent covariance - keep it simple.
+    """
+    def __init__(self, nx):
         super().__init__()
         self.nx = nx
         
-        F_anchor = torch.eye(nx)
-        self.register_buffer('F_anchor', F_anchor)
+        # Parameterize Q via Cholesky factor
+        # Initialize to small diagonal
+        self.L_diag_raw = nn.Parameter(torch.full((nx,), -3.0))  # softplus(-3) ≈ 0.05
+        self.L_lower = nn.Parameter(torch.zeros(nx * (nx - 1) // 2))
         
-        self.n_input = nx + (nx * (nx - 1) // 2)
-        self.n_diag = nx
-        self.n_lower = nx * (nx - 1) // 2
-        self.n_output = self.n_diag + self.n_lower
-        
-        self.net = nn.Sequential(
-            nn.Linear(self.n_input, hidden),
-            nn.LayerNorm(hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, self.n_output)
-        )
-        
-        self.register_buffer('tril_idx', torch.tril_indices(nx, nx, offset=-1))
-        
-        # --- MEDIUM STIFFNESS INIT ---
-        # Softplus(-4.0) ~= 0.018
-        # Scaled (x100) ~= 1.8 meters uncertainty.
-        # This is tight enough to encourage physics, but loose enough to prevent explosion.
-        with torch.no_grad():
-            self.net[-1].weight.mul_(0.001)
-            self.net[-1].bias.zero_()
-            self.net[-1].bias[:self.n_diag].fill_(-4.0)
-
-    def extract_features(self, P):
-        diags = torch.diagonal(P, dim1=1, dim2=2)
-        log_diags = torch.log(torch.clamp(diags, min=1e-8))
-        lower = P[:, self.tril_idx[0], self.tril_idx[1]]
-        return torch.cat([log_diags, lower], dim=1)
-
+        self.register_buffer('tril_indices', torch.tril_indices(nx, nx, offset=-1))
+    
+    def get_Q(self):
+        L = torch.zeros(self.nx, self.nx, device=self.L_diag_raw.device)
+        L.diagonal().copy_(F.softplus(self.L_diag_raw) + 1e-6)
+        L[self.tril_indices[0], self.tril_indices[1]] = self.L_lower
+        return L @ L.T
+    
     def forward(self, P_old):
-        B = P_old.shape[0]
-        
-        P_anchor = self.F_anchor @ P_old @ self.F_anchor.T
-        
-        features = self.extract_features(P_old)
-        out = self.net(features)
-        
-        raw_diag = out[:, :self.n_diag]
-        diag_vals = F.softplus(raw_diag) + 1e-8
-        lower_vals = out[:, self.n_diag:]
-        
-        L = torch.zeros(B, self.nx, self.nx, device=P_old.device)
-        L.as_strided((B, self.nx), (self.nx*self.nx, self.nx + 1)).copy_(diag_vals)
-        L[:, self.tril_idx[0], self.tril_idx[1]] = lower_vals
-        
-        Q = L @ L.transpose(1, 2)
-        
-        return P_anchor + Q
+        Q = self.get_Q()
+        P_new = P_old + Q.unsqueeze(0)
+        return P_new
 
-# =============================================================================
-# UKF CORE
-# =============================================================================
+
 class UKFCore:
     def __init__(self, nx, nz, R, device):
-        self.nx = nx; self.nz = nz; self.device = device
+        self.nx = nx
+        self.nz = nz
+        self.device = device
         self.R = torch.as_tensor(R, dtype=torch.float32, device=device)
-        if self.R.dim() == 2: self.R = self.R.unsqueeze(0)
+        if self.R.dim() == 2:
+            self.R = self.R.unsqueeze(0)
         
-        alpha = 1.0; beta = 2.0; kappa = 0.0
+        alpha, beta, kappa = 1.0, 2.0, 0.0
         lmbda = alpha**2 * (nx + kappa) - nx
         self.gamma = np.sqrt(nx + lmbda)
         self.n_sigma = 2 * nx + 1
@@ -157,18 +141,22 @@ class UKFCore:
         Wm = torch.zeros(self.n_sigma, device=device)
         Wc = torch.zeros(self.n_sigma, device=device)
         denom = nx + lmbda
-        Wm[0] = lmbda/denom; Wc[0] = Wm[0] + (1-alpha**2+beta)
-        Wm[1:] = 0.5/denom; Wc[1:] = Wm[1:]
+        Wm[0] = lmbda / denom
+        Wc[0] = Wm[0] + (1 - alpha**2 + beta)
+        Wm[1:] = 0.5 / denom
+        Wc[1:] = Wm[1:]
         self.Wm, self.Wc = Wm, Wc
 
     def _safe_cholesky(self, P):
-        try: return torch.linalg.cholesky(P + 1e-5 * torch.eye(self.nx, device=self.device))
+        try:
+            return torch.linalg.cholesky(P + 1e-5 * torch.eye(self.nx, device=self.device))
         except:
-            v, e = torch.linalg.eigh(P + 1e-5 * torch.eye(self.nx, device=self.device))
-            v = torch.clamp(v, min=1e-5)
-            return e @ torch.diag_embed(torch.sqrt(v))
+            eigvals, eigvecs = torch.linalg.eigh(P + 1e-5 * torch.eye(self.nx, device=self.device))
+            eigvals = torch.clamp(eigvals, min=1e-5)
+            return eigvecs @ torch.diag_embed(torch.sqrt(eigvals))
 
     def update(self, x_pred, P_pred, z, h_fn):
+        B = x_pred.shape[0]
         L = self._safe_cholesky(P_pred)
         sigmas = [x_pred]
         for i in range(self.nx):
@@ -176,31 +164,33 @@ class UKFCore:
             sigmas.append(x_pred - self.gamma * L[:, :, i])
         sigma = torch.stack(sigmas, dim=1)
         
-        z_sigma = h_fn(sigma.reshape(-1, self.nx)).reshape(x_pred.shape[0], self.n_sigma, self.nz)
+        z_sigma = h_fn(sigma.reshape(-1, self.nx)).reshape(B, self.n_sigma, self.nz)
         z_hat = (self.Wm.view(1, -1, 1) * z_sigma).sum(1)
         z_diff = z_sigma - z_hat.unsqueeze(1)
         x_diff = sigma - x_pred.unsqueeze(1)
         
-        S = self.R.clone()
-        C = torch.zeros(x_pred.shape[0], self.nx, self.nz, device=self.device)
+        S = self.R.expand(B, -1, -1).clone()
+        C = torch.zeros(B, self.nx, self.nz, device=self.device)
         
         for i in range(self.n_sigma):
-            wd = self.Wc[i].view(1, 1, 1)
+            wd = self.Wc[i]
             S = S + wd * (z_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2))
             C = C + wd * (x_diff[:, i].unsqueeze(-1) @ z_diff[:, i].unsqueeze(-2))
             
-        try: K = torch.linalg.solve(S, C.transpose(1, 2)).transpose(1, 2)
-        except: K = C @ torch.linalg.pinv(S)
+        try:
+            K = torch.linalg.solve(S, C.transpose(1, 2)).transpose(1, 2)
+        except:
+            K = C @ torch.linalg.pinv(S)
             
         y = z - z_hat
         x_new = x_pred + (K @ y.unsqueeze(-1)).squeeze(-1)
         P_new = P_pred - K @ S @ K.transpose(-1, -2)
+        P_new = 0.5 * (P_new + P_new.transpose(-1, -2))
+        
         return x_new, P_new, y, S
 
-# =============================================================================
-# WRAPPER (Restored)
-# =============================================================================
-class NeuralKFv10:
+
+class NeuralKFv23:
     def __init__(self, mean_net, cov_net, scaler, R, device):
         self.mean_net = mean_net
         self.cov_net = cov_net
@@ -209,13 +199,16 @@ class NeuralKFv10:
         self.device = device
         
     def run(self, z_seq, x0, P0, h_fn):
-        self.mean_net.eval(); self.cov_net.eval()
+        self.mean_net.eval()
+        self.cov_net.eval()
+        
         z_seq = torch.as_tensor(z_seq, dtype=torch.float32, device=self.device)
-        if z_seq.dim() == 2: z_seq = z_seq.unsqueeze(0)
+        if z_seq.dim() == 2:
+            z_seq = z_seq.unsqueeze(0)
         B, T, _ = z_seq.shape
         
-        x = torch.as_tensor(x0, device=self.device).unsqueeze(0).expand(B, -1)
-        P = torch.as_tensor(P0, device=self.device).unsqueeze(0).expand(B, -1, -1)
+        x = torch.as_tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0).expand(B, -1).clone()
+        P = torch.as_tensor(P0, dtype=torch.float32, device=self.device).unsqueeze(0).expand(B, -1, -1).clone()
         
         states, covs = [], []
         
@@ -223,65 +216,81 @@ class NeuralKFv10:
             for t in range(T):
                 x_norm = self.scaler.normalize(x)
                 P_norm = self.scaler.scale_cov(P)
+                
                 x_pred_norm = self.mean_net(x_norm)
                 P_pred_norm = self.cov_net(P_norm)
+                
                 x_pred = self.scaler.denormalize(x_pred_norm)
                 P_pred = self.scaler.unscale_cov(P_pred_norm)
+                
                 x, P, _, _ = self.ukf.update(x_pred, P_pred, z_seq[:, t], h_fn)
+                
                 states.append(x.cpu().numpy())
                 covs.append(P.cpu().numpy())
+                
         return np.array(states).transpose(1, 0, 2), np.array(covs).transpose(1, 0, 2, 3)
 
-# =============================================================================
-# TRAINING LOOP
-# =============================================================================
-def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=400, lr=1e-3, device='cpu', **kwargs):
+
+def train_v23(z_train, R, h_fn, x0, P0, nx, nz, 
+              pos_scale=100.0, vel_scale=1.0,
+              epochs=400, lr=1e-3, device='cpu',
+              checkpoint_path=None, verbose=True, **kwargs):
+    """
+    Simple training with NLL loss only.
+    Focus on stability and understanding what's learnable.
+    """
     device = torch.device(device)
     z_train = torch.as_tensor(z_train, dtype=torch.float32, device=device)
     
-    scaler = StateScaler(100.0, 10.0, device)
-    
-    mean_net = MeanNet(nx).to(device)
-    cov_net = CovNetFromP(nx).to(device)
+    scaler = StateScaler(pos_scale, vel_scale, device)
+    mean_net = SimpleDynamicsNet(nx).to(device)
+    cov_net = FixedCovPredictor(nx).to(device)
     ukf = UKFCore(nx, nz, R, device)
     
-    # Optimizer: Uniform 1e-3
-    opt_linear = optim.Adam(mean_net.linear.parameters(), lr=1e-3)
-    opt_mlp    = optim.Adam(mean_net.mlp.parameters(), lr=1e-3)
-    opt_cov    = optim.Adam(cov_net.parameters(), lr=1e-3)
+    # Start with frozen covariance
+    for p in cov_net.parameters():
+        p.requires_grad = False
     
-    print(f"[Train] v19 Stabilized Descent | Medium Stiffness")
+    optimizer = optim.Adam(mean_net.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5, min_lr=1e-5)
     
-    history = {'loss': [], 'best_epoch': 0}
-    best_loss = float('inf')
+    x0_t = torch.as_tensor(x0, dtype=torch.float32, device=device)
+    P0_t = torch.as_tensor(P0, dtype=torch.float32, device=device)
     
-    PHASE_2 = 100 # Unfreeze MLP
-    PHASE_3 = 200 # Unfreeze Cov
+    if verbose:
+        print(f"[Train] v23 Simple Baseline")
+        print(f"  Phase 1 (ep 0-199): Train mean only, freeze cov")
+        print(f"  Phase 2 (ep 200+): Train both")
+    
+    history = {'loss': [], 'best_epoch': 0, 'best_loss': float('inf')}
+    best_state = None
+    
+    B, T, _ = z_train.shape
     
     for ep in range(epochs):
-        train_linear = True
-        train_mlp    = (ep >= PHASE_2)
-        train_cov    = (ep >= PHASE_3)
+        # Phase 2: unfreeze covariance
+        if ep == 200:
+            if verbose:
+                print(">>> Phase 2: Unfreezing covariance <<<")
+            for p in cov_net.parameters():
+                p.requires_grad = True
+            optimizer = optim.Adam([
+                {'params': mean_net.parameters(), 'lr': lr * 0.1},
+                {'params': cov_net.parameters(), 'lr': lr * 0.1},
+            ])
         
-        if ep == PHASE_2: print(">>> Phase 2: Unfreezing MLP <<<")
-        if ep == PHASE_3: print(">>> Phase 3: Unfreezing Covariance <<<")
-            
         mean_net.train()
-        cov_net.train() if train_cov else cov_net.eval()
+        cov_net.train()
+        optimizer.zero_grad()
         
-        opt_linear.zero_grad()
-        if train_mlp: opt_mlp.zero_grad()
-        if train_cov: opt_cov.zero_grad()
-        
-        B = z_train.shape[0]
-        x = torch.as_tensor(x0, device=device).unsqueeze(0).expand(B, -1)
-        P = torch.as_tensor(P0, device=device).unsqueeze(0).expand(B, -1, -1)
+        x = x0_t.unsqueeze(0).expand(B, -1).clone()
+        P = P0_t.unsqueeze(0).expand(B, -1, -1).clone()
         
         total_loss = 0
-        loss_chunk = 0
         tbptt_len = 10
+        chunk_loss = 0
         
-        for t in range(z_train.shape[1]):
+        for t in range(T):
             x_norm = scaler.normalize(x)
             P_norm = scaler.scale_cov(P)
             
@@ -293,47 +302,146 @@ def train_v10(z_train, R, h_fn, x0, P0, nx, nz, epochs=400, lr=1e-3, device='cpu
             
             x, P, y, S = ukf.update(x_pred, P_pred, z_train[:, t], h_fn)
             
+            # NLL loss
             try:
-                L_S = torch.linalg.cholesky(S)
+                L_S = torch.linalg.cholesky(S + 1e-6 * torch.eye(nz, device=device))
                 log_det = 2 * torch.sum(torch.log(torch.diagonal(L_S, dim1=-2, dim2=-1)), dim=-1)
                 sol = torch.linalg.solve(L_S, y.unsqueeze(-1)).squeeze(-1)
                 mahal = torch.sum(sol**2, dim=-1)
             except:
                 mahal = torch.sum(y**2, dim=-1)
                 log_det = torch.zeros_like(mahal) + 5.0
-                
+            
             loss_t = torch.mean(log_det + mahal)
-            loss_chunk += loss_t
+            chunk_loss += loss_t
             
             if (t + 1) % tbptt_len == 0:
-                avg_loss = loss_chunk / tbptt_len
+                avg_loss = chunk_loss / tbptt_len
                 avg_loss.backward()
                 
-                # Strict Clipping (0.5) to prevent jumping
-                torch.nn.utils.clip_grad_norm_(mean_net.linear.parameters(), 0.5)
-                opt_linear.step()
-                opt_linear.zero_grad()
+                torch.nn.utils.clip_grad_norm_(mean_net.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 1.0)
                 
-                if train_mlp:
-                    torch.nn.utils.clip_grad_norm_(mean_net.mlp.parameters(), 0.5)
-                    opt_mlp.step()
-                    opt_mlp.zero_grad()
+                optimizer.step()
+                optimizer.zero_grad()
                 
-                if train_cov:
-                    torch.nn.utils.clip_grad_norm_(cov_net.parameters(), 0.5)
-                    opt_cov.step()
-                    opt_cov.zero_grad()
-                
-                x = x.detach(); P = P.detach()
+                x = x.detach()
+                P = P.detach()
                 total_loss += avg_loss.item()
-                loss_chunk = 0
-
-        if ep % 20 == 0:
-            print(f"Ep {ep} | Loss: {total_loss:.4f}")
+                chunk_loss = 0
         
         history['loss'].append(total_loss)
-        if total_loss < best_loss:
-            best_loss = total_loss
+        scheduler.step(total_loss)
+        
+        if total_loss < history['best_loss']:
+            history['best_loss'] = total_loss
             history['best_epoch'] = ep
-
+            best_state = {
+                'mean_net': {k: v.cpu().clone() for k, v in mean_net.state_dict().items()},
+                'cov_net': {k: v.cpu().clone() for k, v in cov_net.state_dict().items()},
+            }
+        
+        if verbose and ep % 20 == 0:
+            with torch.no_grad():
+                # Test delta at a few points
+                test_x = torch.tensor([
+                    [1.0, 0.01, 0.5, 0.005],  # normalized typical state
+                ], device=device, dtype=torch.float32)
+                delta = mean_net.get_delta(test_x)[0].cpu().numpy()
+                Q = cov_net.get_Q().cpu().numpy()
+            
+            print(f"Ep {ep:3d} | Loss: {total_loss:.3f} | "
+                  f"delta=[{delta[0]:.4f}, {delta[1]:.4f}, {delta[2]:.4f}, {delta[3]:.4f}] | "
+                  f"Q_diag=[{Q[0,0]:.4f}, {Q[1,1]:.4f}, {Q[2,2]:.4f}, {Q[3,3]:.4f}]")
+    
+    # Load best
+    if best_state is not None:
+        mean_net.load_state_dict({k: v.to(device) for k, v in best_state['mean_net'].items()})
+        cov_net.load_state_dict({k: v.to(device) for k, v in best_state['cov_net'].items()})
+        if verbose:
+            print(f"\nLoaded best model from epoch {history['best_epoch']}")
+    
+    if checkpoint_path:
+        torch.save({
+            'mean_net': mean_net.state_dict(),
+            'cov_net': cov_net.state_dict(),
+            'history': history,
+        }, checkpoint_path)
+    
     return mean_net, cov_net, scaler, history
+
+
+def analyze_gradients(mean_net, cov_net, scaler, ukf, z_batch, x0, P0, h_fn, device):
+    """
+    Diagnostic: Analyze gradient magnitudes to understand what's learnable.
+    """
+    mean_net.train()
+    
+    x0_t = torch.as_tensor(x0, dtype=torch.float32, device=device)
+    P0_t = torch.as_tensor(P0, dtype=torch.float32, device=device)
+    
+    B = z_batch.shape[0]
+    x = x0_t.unsqueeze(0).expand(B, -1).clone()
+    P = P0_t.unsqueeze(0).expand(B, -1, -1).clone()
+    
+    # Single step
+    x_norm = scaler.normalize(x)
+    P_norm = scaler.scale_cov(P)
+    
+    x_pred_norm = mean_net(x_norm)
+    P_pred_norm = cov_net(P_norm)
+    
+    x_pred = scaler.denormalize(x_pred_norm)
+    P_pred = scaler.unscale_cov(P_pred_norm)
+    
+    x_new, P_new, y, S = ukf.update(x_pred, P_pred, z_batch[:, 0], h_fn)
+    
+    # Compute gradients w.r.t. each output component
+    grads = {}
+    for i, name in enumerate(['x', 'vx', 'y', 'vy']):
+        mean_net.zero_grad()
+        loss = x_pred[:, i].sum()
+        loss.backward(retain_graph=True)
+        
+        total_grad = 0
+        for p in mean_net.parameters():
+            if p.grad is not None:
+                total_grad += p.grad.abs().sum().item()
+        grads[f'd_pred_{name}'] = total_grad
+    
+    # Gradient from NLL loss
+    mean_net.zero_grad()
+    try:
+        L_S = torch.linalg.cholesky(S + 1e-6 * torch.eye(2, device=device))
+        log_det = 2 * torch.sum(torch.log(torch.diagonal(L_S, dim1=-2, dim2=-1)), dim=-1)
+        sol = torch.linalg.solve(L_S, y.unsqueeze(-1)).squeeze(-1)
+        mahal = torch.sum(sol**2, dim=-1)
+        nll = torch.mean(log_det + mahal)
+    except:
+        nll = torch.mean(y**2)
+    
+    nll.backward()
+    total_grad = 0
+    for p in mean_net.parameters():
+        if p.grad is not None:
+            total_grad += p.grad.abs().sum().item()
+    grads['d_NLL'] = total_grad
+    
+    return grads
+
+
+if __name__ == "__main__":
+    print("Testing SimpleDynamicsNet...")
+    net = SimpleDynamicsNet(4)
+    x = torch.randn(5, 4)
+    y = net(x)
+    delta = net.get_delta(x)
+    print(f"Max delta at init: {delta.abs().max().item():.6f}")
+    
+    print("\nTesting FixedCovPredictor...")
+    cov = FixedCovPredictor(4)
+    P = torch.eye(4).unsqueeze(0)
+    P_new = cov(P)
+    Q = cov.get_Q()
+    print(f"Q diagonal: {Q.diag().detach().numpy()}")
+    print(f"P_new diagonal: {P_new[0].diag().detach().numpy()}")
