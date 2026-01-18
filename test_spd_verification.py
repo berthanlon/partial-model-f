@@ -342,6 +342,140 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'variance_comparison.png'), dpi=150)
 plt.close()
 
+# RMSE comparison plot
+plt.figure(figsize=(10, 5))
+neural_rmse_per_t = np.sqrt(np.mean((neural_states_all[:, :, [0,2]] - gt_all[:, :, [0,2]])**2, axis=(0, 2)))
+ukf_rmse_per_t = np.sqrt(np.mean((ukf_states_all[:, :, [0,2]] - gt_all[:, :, [0,2]])**2, axis=(0, 2)))
+plt.plot(t_plot, neural_rmse_per_t, 'b-', lw=2, label='Neural KF v23')
+plt.plot(t_plot, ukf_rmse_per_t, 'r--', lw=2, label='UKF (oracle)')
+plt.xlabel('Time Step')
+plt.ylabel('Position RMSE (m)')
+plt.title('Position RMSE Over Time')
+plt.legend()
+plt.grid(True)
+plt.savefig(os.path.join(output_dir, 'rmse_comparison.png'), dpi=150)
+plt.close()
+
+# RMSE vs time with confidence bands
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Per-sequence RMSE over time
+neural_rmse_per_seq_t = np.sqrt(np.mean((neural_states_all[:, :, [0,2]] - gt_all[:, :, [0,2]])**2, axis=2))
+ukf_rmse_per_seq_t = np.sqrt(np.mean((ukf_states_all[:, :, [0,2]] - gt_all[:, :, [0,2]])**2, axis=2))
+
+neural_mean = np.mean(neural_rmse_per_seq_t, axis=0)
+neural_std = np.std(neural_rmse_per_seq_t, axis=0)
+ukf_mean = np.mean(ukf_rmse_per_seq_t, axis=0)
+ukf_std = np.std(ukf_rmse_per_seq_t, axis=0)
+
+axes[0].plot(t_plot, neural_mean, 'b-', lw=2, label='Neural KF v23')
+axes[0].fill_between(t_plot, neural_mean - neural_std, neural_mean + neural_std, alpha=0.3, color='blue')
+axes[0].plot(t_plot, ukf_mean, 'r--', lw=2, label='UKF (oracle)')
+axes[0].fill_between(t_plot, ukf_mean - ukf_std, ukf_mean + ukf_std, alpha=0.3, color='red')
+axes[0].set_xlabel('Time Step')
+axes[0].set_ylabel('Position RMSE (m)')
+axes[0].set_title('Mean Position RMSE ± Std')
+axes[0].legend()
+axes[0].grid(True)
+
+# Median with percentiles
+neural_median = np.median(neural_rmse_per_seq_t, axis=0)
+neural_p25 = np.percentile(neural_rmse_per_seq_t, 25, axis=0)
+neural_p75 = np.percentile(neural_rmse_per_seq_t, 75, axis=0)
+ukf_median = np.median(ukf_rmse_per_seq_t, axis=0)
+ukf_p25 = np.percentile(ukf_rmse_per_seq_t, 25, axis=0)
+ukf_p75 = np.percentile(ukf_rmse_per_seq_t, 75, axis=0)
+
+axes[1].plot(t_plot, neural_median, 'b-', lw=2, label='Neural KF v23')
+axes[1].fill_between(t_plot, neural_p25, neural_p75, alpha=0.3, color='blue')
+axes[1].plot(t_plot, ukf_median, 'r--', lw=2, label='UKF (oracle)')
+axes[1].fill_between(t_plot, ukf_p25, ukf_p75, alpha=0.3, color='red')
+axes[1].set_xlabel('Time Step')
+axes[1].set_ylabel('Position RMSE (m)')
+axes[1].set_title('Median Position RMSE (25-75 percentile)')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'rmse_vs_time_all_sequences.png'), dpi=150)
+plt.close()
+
+# Box plot
+plt.figure(figsize=(8, 6))
+plt.boxplot([neural_rmse_all, ukf_rmse_all], labels=['Neural KF v23', 'UKF (oracle)'])
+plt.ylabel('Position RMSE (m)')
+plt.title('Position RMSE Distribution')
+plt.grid(True, axis='y')
+plt.savefig(os.path.join(output_dir, 'rmse_boxplot.png'), dpi=150)
+plt.close()
+
+# NEES over time
+neural_nees_per_t = np.zeros((n_eval, n_timesteps))
+ukf_nees_per_t = np.zeros((n_eval, n_timesteps))
+for seq_idx in range(n_eval):
+    for t in range(n_timesteps):
+        err_n = neural_states_all[seq_idx, t] - gt_all[seq_idx, t]
+        err_u = ukf_states_all[seq_idx, t] - gt_all[seq_idx, t]
+        P_n = neural_covs_all[seq_idx, t]
+        P_u = ukf_covs_all[seq_idx, t]
+        try:
+            neural_nees_per_t[seq_idx, t] = err_n @ np.linalg.inv(P_n + 1e-6*np.eye(nx)) @ err_n
+            ukf_nees_per_t[seq_idx, t] = err_u @ np.linalg.inv(P_u + 1e-6*np.eye(nx)) @ err_u
+        except:
+            neural_nees_per_t[seq_idx, t] = np.nan
+            ukf_nees_per_t[seq_idx, t] = np.nan
+
+neural_nees_mean = np.nanmean(neural_nees_per_t, axis=0)
+neural_nees_std = np.nanstd(neural_nees_per_t, axis=0)
+ukf_nees_mean = np.nanmean(ukf_nees_per_t, axis=0)
+ukf_nees_std = np.nanstd(ukf_nees_per_t, axis=0)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(t_plot, neural_nees_mean, 'b-', lw=2, label='Neural KF v23')
+ax.fill_between(t_plot, 
+                np.maximum(neural_nees_mean - neural_nees_std, 0),
+                neural_nees_mean + neural_nees_std,
+                alpha=0.3, color='blue')
+ax.plot(t_plot, ukf_nees_mean, 'r--', lw=2, label='UKF (oracle)')
+ax.fill_between(t_plot,
+                np.maximum(ukf_nees_mean - ukf_nees_std, 0),
+                ukf_nees_mean + ukf_nees_std,
+                alpha=0.3, color='red')
+ax.axhline(nx, color='green', ls=':', lw=2, label=f'Expected (nx={nx})')
+ax.axhspan(nx - 2*np.sqrt(2*nx), nx + 2*np.sqrt(2*nx), alpha=0.1, color='green', label='95% interval')
+ax.set_xlabel('Time Step')
+ax.set_ylabel('NEES')
+ax.set_title('Normalized Estimation Error Squared (NEES) Over Time')
+ax.legend()
+ax.grid(True)
+ax.set_ylim(0, max(12, np.nanmax(neural_nees_mean + neural_nees_std) * 1.1))
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'nees_over_time.png'), dpi=150)
+plt.close()
+
+# Calibration check
+neural_sq_err = (neural_states_all - gt_all)**2
+ukf_sq_err = (ukf_states_all - gt_all)**2
+neural_mse_per_state = np.mean(neural_sq_err, axis=0)
+ukf_mse_per_state = np.mean(ukf_sq_err, axis=0)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+cal_labels = ['x', 'vx', 'y', 'vy']
+for i, (ax, lbl) in enumerate(zip(axes.flat, cal_labels)):
+    ax.semilogy(t_plot, neural_mse_per_state[:, i], 'b-', lw=2, label='Neural MSE')
+    ax.semilogy(t_plot, neural_vars_mean[:, i], 'b--', lw=2, label='Neural Variance')
+    ax.semilogy(t_plot, ukf_mse_per_state[:, i], 'r-', lw=2, label='UKF MSE')
+    ax.semilogy(t_plot, ukf_vars_mean[:, i], 'r--', lw=2, label='UKF Variance')
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel(f'{lbl}²')
+    ax.set_title(f'Calibration: {lbl}')
+    ax.legend()
+    ax.grid(True, which='both', alpha=0.3)
+plt.suptitle('Calibration: MSE vs Predicted Variance\n(Well-calibrated: solid ≈ dashed)', fontsize=14)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'calibration_check.png'), dpi=150)
+plt.close()
+
 print(f"\nAll plots saved to: {output_dir}")
 
 # =============================================================================

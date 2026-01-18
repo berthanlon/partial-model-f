@@ -96,32 +96,95 @@ class SimpleDynamicsNet(nn.Module):
 
 class FixedCovPredictor(nn.Module):
     """
-    Fixed covariance prediction: P' = P + Q
-    where Q is a learned constant SPD matrix.
+    Covariance prediction with residual structure: P_{k|k-1} = P_{k-1|k-1} + ΔP_θ(P_{k-1|k-1})
     
-    No state-dependent covariance - keep it simple.
+    This prevents the covariance from collapsing to arbitrarily small values
+    because the network can only ADD to the covariance, not shrink it arbitrarily.
+    
+    The network learns ΔP as L @ L^T (guaranteed SPD), so P_new = P_old + L @ L^T
+    which is guaranteed to be at least as large as P_old in the PSD sense.
+    
+    This is a middle ground between:
+    - Too restrictive: P + Q (constant Q)
+    - Too flexible: General C_θ(P) (can collapse)
     """
-    def __init__(self, nx):
+    def __init__(self, nx, hidden=64):
         super().__init__()
         self.nx = nx
+        self.n_tril = nx * (nx + 1) // 2  # Elements in lower triangular
         
-        # Parameterize Q via Cholesky factor
-        # Initialize to small diagonal
-        self.L_diag_raw = nn.Parameter(torch.full((nx,), -3.0))  # softplus(-3) ≈ 0.05
-        self.L_lower = nn.Parameter(torch.zeros(nx * (nx - 1) // 2))
+        # Input: features of P (log diagonal + lower triangular)
+        n_input = nx + nx * (nx - 1) // 2
+        
+        self.net = nn.Sequential(
+            nn.Linear(n_input, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, self.n_tril)
+        )
+        
+        # Initialize to output small values (small ΔP initially)
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.1)
+                nn.init.zeros_(m.bias)
+        
+        # Bias diagonal to small positive values
+        # softplus(-3) ≈ 0.05, so ΔP will have small diagonal initially
+        self.net[-1].bias.data[:nx].fill_(-3.0)
         
         self.register_buffer('tril_indices', torch.tril_indices(nx, nx, offset=-1))
+        self.register_buffer('diag_indices', torch.arange(nx))
     
-    def get_Q(self):
-        L = torch.zeros(self.nx, self.nx, device=self.L_diag_raw.device)
-        L.diagonal().copy_(F.softplus(self.L_diag_raw) + 1e-6)
-        L[self.tril_indices[0], self.tril_indices[1]] = self.L_lower
-        return L @ L.T
+    def _extract_features(self, P):
+        """Extract features from covariance matrix."""
+        B = P.shape[0]
+        # Log of diagonal (variances)
+        diag = torch.diagonal(P, dim1=1, dim2=2)
+        log_diag = torch.log(diag.clamp(min=1e-8))
+        # Lower triangular (covariances)
+        lower = P[:, self.tril_indices[0], self.tril_indices[1]]
+        return torch.cat([log_diag, lower], dim=1)
     
     def forward(self, P_old):
-        Q = self.get_Q()
-        P_new = P_old + Q.unsqueeze(0)
+        B = P_old.shape[0]
+        
+        # Extract features from input covariance
+        features = self._extract_features(P_old)
+        
+        # Predict Cholesky factor elements for ΔP
+        L_elements = self.net(features)
+        
+        # Build lower triangular matrix L
+        L = torch.zeros(B, self.nx, self.nx, device=P_old.device)
+        
+        # Diagonal: must be positive (use softplus)
+        L[:, self.diag_indices, self.diag_indices] = F.softplus(L_elements[:, :self.nx]) + 1e-6
+        
+        # Off-diagonal
+        L[:, self.tril_indices[0], self.tril_indices[1]] = L_elements[:, self.nx:]
+        
+        # ΔP = L @ L^T (guaranteed SPD)
+        delta_P = L @ L.transpose(-1, -2)
+        
+        # RESIDUAL: P_new = P_old + ΔP
+        # This guarantees P_new >= P_old in PSD sense (can't shrink!)
+        P_new = P_old + delta_P
+        
         return P_new
+    
+    def get_delta_P(self, P_old):
+        """For diagnostics: return just the learned ΔP."""
+        B = P_old.shape[0]
+        features = self._extract_features(P_old)
+        L_elements = self.net(features)
+        
+        L = torch.zeros(B, self.nx, self.nx, device=P_old.device)
+        L[:, self.diag_indices, self.diag_indices] = F.softplus(L_elements[:, :self.nx]) + 1e-6
+        L[:, self.tril_indices[0], self.tril_indices[1]] = L_elements[:, self.nx:]
+        
+        return L @ L.transpose(-1, -2)
 
 
 class UKFCore:
@@ -244,7 +307,7 @@ def train_v23(z_train, R, h_fn, x0, P0, nx, nz,
     
     scaler = StateScaler(pos_scale, vel_scale, device)
     mean_net = SimpleDynamicsNet(nx).to(device)
-    cov_net = FixedCovPredictor(nx).to(device)
+    cov_net = FixedCovPredictor(nx, hidden=64).to(device)
     ukf = UKFCore(nx, nz, R, device)
     
     # Start with frozen covariance
@@ -348,11 +411,15 @@ def train_v23(z_train, R, h_fn, x0, P0, nx, nz,
                     [1.0, 0.01, 0.5, 0.005],  # normalized typical state
                 ], device=device, dtype=torch.float32)
                 delta = mean_net.get_delta(test_x)[0].cpu().numpy()
-                Q = cov_net.get_Q().cpu().numpy()
+                
+                # Test covariance prediction - show the learned ΔP
+                test_P = torch.eye(nx, device=device).unsqueeze(0) * 0.1
+                delta_P = cov_net.get_delta_P(test_P)
+                dP_diag = torch.diag(delta_P[0]).cpu().numpy()
             
             print(f"Ep {ep:3d} | Loss: {total_loss:.3f} | "
                   f"delta=[{delta[0]:.4f}, {delta[1]:.4f}, {delta[2]:.4f}, {delta[3]:.4f}] | "
-                  f"Q_diag=[{Q[0,0]:.4f}, {Q[1,1]:.4f}, {Q[2,2]:.4f}, {Q[3,3]:.4f}]")
+                  f"ΔP_diag=[{dP_diag[0]:.4f}, {dP_diag[1]:.4f}, {dP_diag[2]:.4f}, {dP_diag[3]:.4f}]")
     
     # Load best
     if best_state is not None:
