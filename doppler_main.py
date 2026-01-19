@@ -115,92 +115,107 @@ def generate_data(n_seq, T):
 # =============================================================================
 # UKF BASELINE (Fixed for Doppler)
 # =============================================================================
-
-class UKFBaseline:
-    """Unscented Kalman Filter with proper Doppler support."""
-    
-    def __init__(self, F, Q, R, h_fn, alpha=0.001, beta=2.0, kappa=0.0):
+# =============================================================================
+# ROBUST UKF CLASS
+# =============================================================================
+class RobustUKF:
+    def __init__(self, F, Q, R, h_fn, alpha=0.1, beta=2.0, kappa=0.0):
         self.F, self.Q, self.R, self.h = F, Q, R, h_fn
         self.nx = F.shape[0]
         self.nz = R.shape[0]
         
-        # UKF sigma point parameters
-        lmbda = alpha**2 * (self.nx + kappa) - self.nx
-        self.gamma = np.sqrt(self.nx + lmbda)
-        n = 2 * self.nx + 1
+        # Sigma Point Parameters
+        # alpha=0.1 is safer for float32/64 than 0.001 to prevent numerical collapse
+        self.alpha = alpha 
+        self.beta = beta
+        self.kappa = kappa
+        self.lmbda = self.alpha**2 * (self.nx + self.kappa) - self.nx
+        self.gamma = np.sqrt(self.nx + self.lmbda)
         
         # Weights
-        self.Wm = np.zeros(n)
-        self.Wc = np.zeros(n)
-        self.Wm[0] = lmbda / (self.nx + lmbda)
-        self.Wc[0] = self.Wm[0] + (1 - alpha**2 + beta)
-        self.Wm[1:] = 0.5 / (self.nx + lmbda)
-        self.Wc[1:] = 0.5 / (self.nx + lmbda)
-        self.n_sigma = n
-    
-    def _ensure_spd(self, P, min_eig=1e-6):
-        """Ensure matrix is symmetric positive definite."""
+        self.n_sigma = 2 * self.nx + 1
+        self.Wm = np.zeros(self.n_sigma)
+        self.Wc = np.zeros(self.n_sigma)
+        self.Wm[0] = self.lmbda / (self.nx + self.lmbda)
+        self.Wc[0] = self.Wm[0] + (1 - self.alpha**2 + self.beta)
+        self.Wm[1:] = 0.5 / (self.nx + self.lmbda)
+        self.Wc[1:] = 0.5 / (self.nx + self.lmbda)
+
+    def _robust_cholesky(self, P):
+        """
+        Attempts Cholesky. If fails, forces positive definiteness.
+        """
+        # 1. Enforce Symmetry
         P = 0.5 * (P + P.T)
-        eigvals, eigvecs = np.linalg.eigh(P)
-        eigvals = np.maximum(eigvals, min_eig)
-        return eigvecs @ np.diag(eigvals) @ eigvecs.T
-    
+        
+        try:
+            return np.linalg.cholesky(P)
+        except np.linalg.LinAlgError:
+            # 2. Eigendecomposition Fallback
+            eigvals, eigvecs = np.linalg.eigh(P)
+            # Clip negative eigenvalues to small positive number
+            eigvals = np.maximum(eigvals, 1e-6)
+            # Reconstruct
+            P_recon = eigvecs @ np.diag(eigvals) @ eigvecs.T
+            return np.linalg.cholesky(P_recon)
+
     def run(self, z_seq, x0, P0):
-        """Run UKF on a sequence of measurements."""
-        T = z_seq.shape[0]
+        T = len(z_seq)
         xs = np.zeros((T, self.nx))
         Ps = np.zeros((T, self.nx, self.nx))
-        x, P = x0.copy(), P0.copy()
+        
+        x_curr = x0.copy()
+        P_curr = P0.copy()
         
         for t in range(T):
-            # === PREDICTION ===
-            x_pred = self.F @ x
-            P_pred = self.F @ P @ self.F.T + self.Q
-            P_pred = self._ensure_spd(P_pred)
+            # =========================================================
+            # STEP 1: UPDATE (Correct x_t using z_t)
+            # =========================================================
             
-            # === SIGMA POINTS ===
-            try:
-                L = np.linalg.cholesky(P_pred)
-            except:
-                P_pred = self._ensure_spd(P_pred, min_eig=1e-4)
-                L = np.linalg.cholesky(P_pred)
-            
+            # A. Generate Sigma Points from Current Estimate
+            L = self._robust_cholesky(P_curr)
             sigma = np.zeros((self.n_sigma, self.nx))
-            sigma[0] = x_pred
+            sigma[0] = x_curr
             for i in range(self.nx):
-                sigma[i + 1] = x_pred + self.gamma * L[:, i]
-                sigma[self.nx + i + 1] = x_pred - self.gamma * L[:, i]
-            
-            # === MEASUREMENT PREDICTION ===
+                sigma[i+1]         = x_curr + self.gamma * L[:, i]
+                sigma[self.nx+i+1] = x_curr - self.gamma * L[:, i]
+                
+            # B. Transform Sigma Points through Measurement Function
             z_sigma = np.array([self.h(s) for s in sigma])
-            z_hat = np.zeros(self.nz)
-            for i in range(self.n_sigma):
-                z_hat += self.Wm[i] * z_sigma[i]
             
-            # === INNOVATION COVARIANCE ===
+            # C. Measurement Mean
+            z_hat = np.sum(self.Wm[:, None] * z_sigma, axis=0)
+            
+            # D. Innovation Covariance (S) & Cross Covariance (C)
             S = self.R.copy()
             C = np.zeros((self.nx, self.nz))
+            
             for i in range(self.n_sigma):
                 dz = z_sigma[i] - z_hat
-                dx = sigma[i] - x_pred
+                dx = sigma[i] - x_curr
                 S += self.Wc[i] * np.outer(dz, dz)
                 C += self.Wc[i] * np.outer(dx, dz)
+                
+            # E. Kalman Gain
+            # Use pseudo-inverse for stability
+            K = C @ np.linalg.pinv(S)
             
-            # Ensure S is SPD
-            S = self._ensure_spd(S)
+            # F. Update State and Covariance
+            x_upd = x_curr + K @ (z_seq[t] - z_hat)
+            P_upd = P_curr - K @ S @ K.T
             
-            # === UPDATE ===
-            try:
-                K = C @ np.linalg.inv(S)
-            except:
-                K = C @ np.linalg.pinv(S)
+            # Store results for this timestep
+            xs[t] = x_upd
+            Ps[t] = P_upd
             
-            x = x_pred + K @ (z_seq[t] - z_hat)
-            P = P_pred - K @ S @ K.T
-            P = self._ensure_spd(P)
+            # =========================================================
+            # STEP 2: PREDICT (Move to t+1)
+            # =========================================================
+            # Standard Linear Prediction (since F is linear here)
+            # Note: If F was non-linear, we would do sigma points again here.
+            x_curr = self.F @ x_upd
+            P_curr = self.F @ P_upd @ self.F.T + self.Q
             
-            xs[t], Ps[t] = x, P
-        
         return xs, Ps
 
 # =============================================================================
@@ -246,7 +261,7 @@ mean_net, cov_net, scaler, history = train_v23(
     z_train=z_train, R=R_true, h_fn=h_torch,
     x0=x0_mean, P0=P0, nx=nx, nz=nz,
     pos_scale=100.0, vel_scale=1.0,
-    epochs=400, lr=1e-3, device=str(device),
+    epochs=1000, lr=1e-3, device=str(device),
     checkpoint_path=os.path.join(output_dir, 'neural_kf_v23_doppler.pth'),
     verbose=True
 )
@@ -314,7 +329,7 @@ class NeuralKFv23Fixed:
         return np.array(states).transpose(1, 0, 2)[0], np.array(covs).transpose(1, 0, 2, 3)[0]
 
 neural_kf = NeuralKFv23Fixed(mean_net, cov_net, scaler, R_true, nx, nz, device)
-ukf_baseline = UKFBaseline(F_true, Q_true, R_true, h_numpy)
+ukf_baseline = RobustUKF(F_true, Q_true, R_true, h_numpy)
 
 neural_states, neural_covs = [], []
 ukf_states, ukf_covs = [], []
